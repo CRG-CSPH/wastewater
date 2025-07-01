@@ -1,0 +1,264 @@
+---
+title: "Environmental Models - Wastewater Normalization Comparison"
+author: "Teresa Smith"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(sf)
+library(lme4)
+library(lmerTest)
+library(lubridate)
+library(ggfortify)
+library(ggplot2)
+library(performance)
+library(lmtest)
+
+###LOAD IN CLIMATE DATASET GENERATED FROM climate_data.Rmd
+load('CO_climate.Rda') 
+CO_climate$date <- as.Date(CO_climate$date)
+
+#CALCULATE AVG TEMP 
+CO_climate$avg_temp <- (CO_climate$maxtemp_C + CO_climate$mintemp_C)/2
+
+#CREATE SNOW ACCUMULATION and RAIN ACCUMULATION VARIABLE 
+CO_climate$snow_acc <- ifelse(CO_climate$avg_temp < 0 , CO_climate$pr, 0)
+CO_climate$rain <- ifelse(CO_climate$avg_temp > 0 , CO_climate$pr, 0)
+
+
+# Add melting trigger (1 if temperature > 0 CELSIUS)
+CO_climate$Trigger <- ifelse(CO_climate$avg_temp > 0, 1, 0)
+
+CO_climate  <- CO_climate %>% dplyr::arrange(date)%>% dplyr::arrange(rowid)
+
+# Calculate cumulative snowfall (until melt starts)
+CO_climate$snow_cum <- NA
+total_snow <- 0
+
+#CO_climate <- CO_climate  %>% filter(COUNTYFP == 117)
+
+for (i in 1:nrow(CO_climate)) {
+  ### WHEN THERE IS NO MELTING 
+     if  (CO_climate$Trigger[i] == 0) {
+    total_snow <- total_snow + CO_climate$snow_acc[i]
+    CO_climate$snow_cum[i] <- total_snow
+    CO_climate$melt[i] <- 0 }
+  ##### WHEN THERE IS MELTING 
+       if  (CO_climate$Trigger[i] == 1) {
+      if(total_snow > 0) {
+          CO_climate$melt[i] <- 2.74*CO_climate$avg_temp[i]
+      total_snow <- total_snow -  CO_climate$melt[i] 
+      CO_climate$snow_cum[i] <- total_snow
+      }
+         #### TOTAL SNOW CAN NEVER BE LESS THAN 0
+         else {
+           CO_climate$melt[i] <- 0 
+             total_snow = 0 
+      CO_climate$snow_cum[i] <- 0
+   
+     } }}
+
+
+
+```
+
+
+
+```{r}
+###cdphe sewershed flow data download (two different files, 1 before 2024, one for 2024)
+library(readxl)
+flow <- read_xlsx('flow.xlsx')
+
+flow$sample_collect_date <- as.Date(flow$sample_collect_date, '%m/%d/%y')
+
+#CLEAN DUPLICATES AND LIMIT TO BEFORE 2025 
+flow1_a <- flow %>% group_by( sample_collect_date, wwtp_name) %>% summarise(flow_rate = mean(flow_rate)) %>% filter(sample_collect_date < '2025-01-01')
+
+flow_before2024 <- read.csv('flow_before2024.csv')
+flow_before2024$sample_collect_date <- as.Date(flow_before2024$sample_collect_date, '%m/%d/%y')
+
+#CALCULATE AVG FLOW RATE BY DAY IN CASES OF DUPLICATES (USUALLY VERY SIMILAR NUMBERS)
+flow_before2024 <- flow_before2024  %>% group_by(  sample_collect_date, wwtp_name) %>% summarise(flow_rate = mean(flow_rate)) %>% filter( sample_collect_date < '2024-01-01')
+
+#COMBINE TWO FILES AFTER CLEANING 
+flow <- rbind(flow1_a, flow_before2024)
+
+#LOAD IN SEWERSHED COUNTIES 
+counties_sewershed <- read.csv('sewershed_elevations_counties.csv')
+
+##CLEAN 
+counties_sewershed$wwtp_name<- counties_sewershed$cdphe_flow_name 
+
+## JOIN FLOW WITH COUNTY DATA 
+flow1 <- left_join(flow, counties_sewershed, by = 'wwtp_name')
+
+
+#LOAD IN FIPS DATA AND MERGE WITH FLOW DATA 
+fips <- read.csv('CO_county_fips.csv')
+fips$County  <- fips$COUNTYNAME
+flow2 <- left_join(flow1, fips, by = 'County' )
+
+table(flow2$COUNTYFP, useNA = 'always')
+
+q<- flow2%>% filter(is.na(COUNTYFP))
+CO_climate$COUNTYFP<- as.numeric(CO_climate$COUNTYFP)
+
+flow2$date <- flow2$sample_collect_date
+
+##### MERGE FLOW AND CLIMATE DATA BY DAY AND SEWERSHED COUNTY
+flow_climate<- left_join(flow2, CO_climate, by = c('COUNTYFP', 'date') ) %>% filter(date < '2025-01-01')
+
+
+#### LOAD IN DEVICE DATA
+devices <-  read.csv('mobility.csv')
+devices$wwtp_name <- devices$AREA_SEWERSHED
+devices$date <- as.Date(devices$DAY)
+
+
+### MERGE DEVICE DATA WITH FLOW DATA 
+full <- left_join(devices, flow_climate, by = c('date', 'wwtp_name'))
+
+
+### FILTER DAYS WITH ONLY BOTH FLOW AND MOBILITY DATA
+###CREATE WEEK VARIABLE
+full$week <- floor_date(full$date, unit = "week", week_start = 7)
+full <- full %>% filter(!is.na(STOPS_BY_DAY_L)) %>% filter(!is.na(flow_rate))
+
+
+#### Identify Time ranges 
+sewershedsum <- full %>% group_by(wwtp_name) %>%  summarise(min = min(date), max = max(date), dur = max-min, obs = n()) %>% filter
+
+
+list <- sewershedsum %>%  filter(dur > 365) %>% dplyr::select(wwtp_name)
+
+list1 <- list$wwtp_name
+###GROUP BY WEEK AND SEWERSHED
+    ## SUM SNOW MELT, RAIN, FLOW RATE, and DEVICE COUNTS
+    ### atleast 365 days of data 
+full_weekly <- full %>% filter(wwtp_name %in% list1 ) %>%   filter(!is.na(STOPS_BY_DAY_L)) %>% filter(!is.na(flow_rate))  %>% filter(!is.na(melt))  %>% filter(!is.na(rain))  %>% group_by(week, wwtp_name) %>%  arrange(wwtp_name, week) %>% summarise(week_devices =  sum(STOPS_BY_DAY_L), week_flow = sum(flow_rate), week_melt = sum(melt), week_rain = sum(rain), obs_week = n())
+
+#CREATE LOG TRANSFORMED FLOW AND DEVICE VARIABLES 
+full_weekly$log_week_flow <- log(full_weekly$week_flow)
+full_weekly$log_week_devices <- log(full_weekly$week_devices)
+
+### ZERO OUT 0 values 
+full_weekly$log_week_devices <- ifelse(is.nan(full_weekly$log_week_devices), 0, full_weekly$log_week_devices )
+
+full_weekly$log_week_devices <- ifelse(is.infinite(full_weekly$log_week_devices), 0, full_weekly$log_week_devices )
+
+full_weekly$log_week_flow<- ifelse(is.nan(full_weekly$log_week_flow), 0, full_weekly$log_week_flow)
+
+full_weekly$log_week_flow <-ifelse(is.infinite(full_weekly$log_week_flow), 0, full_weekly$log_week_flow)
+
+
+###CREATE A WEEKLY LAG FLOW VARIABLE
+full_weekly <- 
+    full_weekly %>% arrange(wwtp_name, week,obs_week) %>% 
+    group_by(wwtp_name) %>%
+    mutate(lag_log_week_flow = dplyr::lag(log_week_flow, n = 1, default = NA)) 
+
+
+## FILTER ANY NAS FOR THESE VARS 
+full_weekly <- full_weekly %>%  filter(!is.na(log_week_flow))
+full_weekly <- full_weekly %>%  filter(!is.na(log_week_devices))
+full_weekly <- full_weekly %>%  filter(!is.na(lag_log_week_flow))
+
+
+###CREATE YEAR VARIABLE
+full_weekly$year <- as.factor(year(full_weekly$week))
+
+###TOTAL RUNOFF VARIABLE
+full_weekly$tot_perc <- full_weekly$week_rain + full_weekly$week_melt
+
+
+##COUNTS BY SEWERSHED BY BY WEEK 
+
+full_weekly_n <- full_weekly%>% group_by(wwtp_name) %>% summarise( avg_obs = mean(obs_week), min = min(obs_week), max = max(obs_week))
+
+
+
+```
+
+
+```{r}
+### JOIN WITH CLUSTERS 
+cluster <- read.csv('cluster_table.csv')
+names <- read.csv('sewershed_names.csv')
+
+cluster <- left_join(cluster, names)
+
+cluster$wwtp_name <- cluster$cdphe_flow_name
+
+###### JOIN FULL WEEKLY DATASET WITH CLUSTER DATA 
+full_weeklya <- left_join(full_weekly, cluster)
+
+
+#################MODELS#################################################
+
+### JUST HIGH VARIATION 
+high <- full_weeklya %>% filter(cluster == 'High-Variation')
+
+high3  <- lmer( log_week_flow ~ ( 1 + log_week_devices |wwtp_name) + log_week_devices +  year + lag_log_week_flow  + week_rain + week_melt , data = high, REML = TRUE, control=lmerControl(optimizer="bobyqa"))
+
+summary(high3)
+
+
+### JUST LOW 
+low <- full_weeklya %>% filter(cluster == 'Low-Variation')
+
+low3  <- lmer( log_week_flow ~ ( 1 + log_week_devices |wwtp_name) + log_week_devices +  year + lag_log_week_flow + week_rain + week_melt, data = low, REML = TRUE,
+               control=lmerControl(optimizer="bobyqa"))
+
+summary(low3)
+
+#### ADDED RANDOM SLOPES 
+high5 <- lmer( log_week_flow ~ ( 1 + log_week_devices + week_melt + week_rain  |wwtp_name) + log_week_devices +  year + lag_log_week_flow  + week_rain + week_melt , data = high, REML = TRUE, control=lmerControl(optimizer="bobyqa"))
+
+summary(high5)
+
+
+
+low5 <- lmer( log_week_flow ~ ( 1 + log_week_devices + week_melt + week_rain  |wwtp_name) + log_week_devices +  year + lag_log_week_flow  + week_rain + week_melt , data = low, REML = TRUE, control=lmerControl(optimizer="bobyqa"))
+
+summary(low5)
+
+
+BIC(low5, low3)
+
+BIC(high5, high3)
+
+
+####USE MODEL 3  
+
+
+
+```
+
+
+```{r}
+### BUILD DATASET FOR DESCRIPTIVE FIGURE 
+
+
+###make dataset with duplicate rows across entire time period and link to county data 
+
+sewershedsum <- sewershedsum %>%  dplyr::select(wwtp_name, min, max)
+sewershed_build <- left_join(sewershedsum, counties_sewershed)
+
+library(data.table)
+
+ sewershed_build <- data.table(sewershed_build)
+
+sewershed_build1 <- sewershed_build[,.(wwtp_name, County, Date = seq.Date(min, max, 1)), by=.(n=row.names(sewershed_build))][,-1]
+
+sewershed_county_daily_runoff <-  left_join(sewershed_build1, fips, by = 'County') 
+
+sewershed_county_daily_runoff$date <- sewershed_county_daily_runoff$Date
+sewershed_county_daily_runoff1 <-  left_join(sewershed_county_daily_runoff, CO_climate, by = c('COUNTYFP', 'date')) 
+sewershed_county_daily_runoff1$runoff <- sewershed_county_daily_runoff1$melt + sewershed_county_daily_runoff1$rain
+
+sewershed_county_daily_runoff1 <- sewershed_county_daily_runoff1 %>% dplyr::select(wwtp_name, date, County, melt, rain, runoff)
+write.csv(sewershed_county_daily_runoff1, 'sewershed_runoff_timeseries.csv')
+
+```
+

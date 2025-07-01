@@ -1,0 +1,207 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+
+
+
+```{r}
+
+
+
+
+
+
+library(terra)
+library(rasterVis)
+library(raster)
+library(exactextractr)
+library(data.table)
+library(stringr)
+library(lubridate)
+library(dplyr)
+
+### PULL CO COUNTY INFO
+
+CO_counties <- tigris::counties(state = "CO") %>% 
+  dplyr::select(STATEFP, COUNTYFP)
+  
+ 
+ 
+
+```
+
+
+```{r}
+
+#CREATE FUNCTION TO PULL CLIMATE DATA (MAX TEMP, MIN TEMP, PRECIPITATION IN MM OF WATER) 
+
+get_grid_MET <- function(var_name, year) {
+
+options(timeout = 300)
+
+  target_url <- 
+  paste0(
+    "http://www.northwestknowledge.net/metdata/data/",
+    var_name, "_", year,
+    ".nc"
+  )
+
+  file_name <-
+  paste0(
+    var_name, "_", year,
+    ".nc"
+  )
+
+  downloader::download(
+    url = target_url,
+    destfile = file_name,
+    mode = 'wb'
+  )
+
+  #--- read the raster data ---#
+  temp_rast <- rast(file_name)
+
+  temp_data <- 
+  #--- extract data for each county ---#
+  exact_extract(temp_rast, CO_counties) %>% 
+  #--- list of data.frames into data.table ---#
+  rbindlist(idcol = "rowid") %>% 
+  #--- wide to long ---#
+  melt(id.var = c("rowid", "coverage_fraction")) %>% 
+  #--- remove observations with NA values ---#
+  .[!is.na(value), ] %>% 
+  #--- get only the numeric part ---#
+  .[, variable := str_sub(variable, -5, -1) %>% as.numeric()] %>% 
+  #--- recover dates ---#
+  .[, date := variable + ymd("1900-01-01")] %>% 
+  #--- find daily coverage-weight average by county ---#
+  .[, 
+    .(value = sum(value * coverage_fraction) / sum(coverage_fraction)), 
+    by = .(rowid, date)
+  ] %>% 
+  .[, var := var_name]
+
+  return(temp_data)
+
+}
+
+
+```
+
+
+```{r}
+library(data.table)
+library(future)
+library(future.apply)
+
+
+# Setup future plan
+if (future::supportsMulticore()) {
+  future::plan(future::multicore)
+} else {
+  future::plan(future::multisession)
+}
+
+# Create parameter data
+par_data <- expand.grid(
+  var_name = c("pr", "tmmx", "tmmn"),
+  year = c(2020, 2021)
+) %>%
+  data.table() %>%
+  .[, var_name := as.character(var_name)]
+
+# Apply function in parallel
+all_data0 <- future_lapply(
+  seq_len(nrow(par_data)), 
+  function(x) get_grid_MET(par_data[x, var_name], par_data[x, year]),
+  future.seed = TRUE  # Ensures reproducible and safe random numbers
+) %>%
+  rbindlist(fill = TRUE) %>%
+  dcast(rowid + date ~ var, value.var = "value")
+
+save(all_data0, file = "all_data0.Rda")
+
+par_data <- expand.grid(
+  var_name = c("pr", "tmmx", "tmmn"),
+  year = 2022
+) %>%
+  data.table() %>%
+  .[, var_name := as.character(var_name)]
+
+all_data1 <- future_lapply(
+  seq_len(nrow(par_data)), 
+  function(x) get_grid_MET(par_data[x, var_name], par_data[x, year])
+) %>%
+  rbindlist(fill = TRUE) %>%
+
+  dcast(rowid + date ~ var, value.var = "value")
+
+save(all_data1, file = "all_data1.Rda")
+
+
+par_data <- expand.grid(
+  var_name = c("pr", "tmmx", "tmmn"),
+  year = 2023
+) %>%
+  data.table() %>%
+  .[, var_name := as.character(var_name)]
+
+all_data2 <- future_lapply(
+  seq_len(nrow(par_data)), 
+  function(x) get_grid_MET(par_data[x, var_name], par_data[x, year])
+) %>%
+  rbindlist(fill = TRUE) %>%
+
+  dcast(rowid + date ~ var, value.var = "value")
+
+save(all_data2, file = "all_data2.Rda")
+
+
+par_data <- expand.grid(
+  var_name = c("pr", "tmmx", "tmmn"),
+  year = 2024
+) %>%
+  data.table() %>%
+  .[, var_name := as.character(var_name)]
+
+all_data3 <- future_lapply(
+  seq_len(nrow(par_data)), 
+  function(x) get_grid_MET(par_data[x, var_name], par_data[x, year])
+) %>%
+  rbindlist(fill = TRUE) %>%
+  dcast(rowid + date ~ var, value.var = "value")
+
+save(all_data3, file = "all_data3.Rda")
+
+#### JOIN ALL DATA 
+CO_counties$rowid <- 1:nrow(CO_counties)
+
+CO_2024 <- left_join(all_data3, CO_counties)
+CO_2023 <- left_join(all_data2, CO_counties)
+CO_2022 <- left_join(all_data1, CO_counties)
+CO_2020_2021 <- left_join(all_data0, CO_counties)
+
+CO_climate <- rbind(CO_2024, CO_2023)
+CO_climate <- rbind(CO_climate, CO_2022)
+CO_climate <- rbind(CO_climate, CO_2020_2021)
+
+CO_climate$maxtemp_C <- CO_climate$tmmx -273.15
+CO_climate$mintemp_C <- CO_climate$tmmn -273.15
+
+
+CO_climate1 <- CO_climate
+save(CO_climate, file = "CO_climate.Rda")
+
+
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
