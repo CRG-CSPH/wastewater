@@ -10,28 +10,31 @@ setwd("/Users/emwu9912/Documents/CU Anschutz/COVID Wastewater/")
 
 # load libraries
 library(pacman)
-p_load(gridExtra, NonParRolCor, tidyverse)
+p_load(gridExtra, NonParRolCor, tidyverse, zoo)
 
 load("DataProcessed/flow_mobile_corr_daily.Rda")
 
 # fill daily timestep so there are no missing values
 flow_mobile_corr_daily_fill <- flow_mobile_corr_daily %>%
   group_by(sewershed_analysis_name) %>%
+  # delete all rows after last non-missing value in flow data
+  filter(rev(cumany(!is.na(rev(flow_rate_log_norm))))) %>%
   # last observation carried forward
-  fill(c(flow_rate), .direction = "down") %>%
+  fill(c(flow_rate_log_norm), .direction = "down") %>%
   # create 7-day moving average for device count and flow
-  mutate(total_devices_daily_7daymovingavg = zoo::rollmean(total_devices_daily, k = 7, fill = NA, align = "right"),
-         flow_rate_7daymovingavg = zoo::rollmean(flow_rate, k = 7, fill = NA, align = "right")) %>%
+  mutate(total_devices_daily_7daymovingavg = zoo::rollmean(total_devices_daily_log_norm, k = 7, fill = NA, align = "right"),
+         flow_rate_7daymovingavg = zoo::rollmean(flow_rate_log_norm, k = 7, fill = NA, align = "right")) %>%
   ungroup() %>%
+  # restrict time series
   drop_na()
 
 save(flow_mobile_corr_daily_fill, file = "DataProcessed/flow_mobile_corr_daily_fill.Rda")
 
-# check how many sewersheds remain (which also creates the vector for the for-loop)
+# confirm there are still 66 sewersheds (which also creates the vector for the for-loop)
 corr_sewersheds <- unique(unlist(flow_mobile_corr_daily_fill$sewershed_analysis_name))
 corr_sewersheds
 
-# get sample sizes
+# confirm sample sizes
 flow_mobile_corr_daily_fill %>%
   group_by(sewershed_analysis_name) %>%
   slice(1) %>%
@@ -57,7 +60,7 @@ corr_estim <- list()
 corr_list <- mget(ls(pattern = "input_"))
 for (i in seq_along(corr_list)){
   corr_estim[[i]] <- rolcor_estim_1win(corr_list[[i]], CorMethod = "spearman", widthwin = 90,
-                                       Align = "right",rmltrd = T, Scale = T, MCSim = 1000,
+                                       Align = "right",rmltrd = T, Scale = F, MCSim = 1000,
                                        Np = 2, prob = 0.95)
 }
 
