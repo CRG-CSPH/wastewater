@@ -42,8 +42,8 @@ for(i in seq_along(corr_sewersheds)){
 
 corr_df_long <- bind_rows(corr_df) %>%
   left_join(sewershed_names) %>%
-  mutate(cluster = case_when(sewershed_analysis_name %in% visit_with_cluster$sewershed_analysis_name[visit_with_cluster$cluster=="High-Variation"] ~ "High-Variation",
-                             TRUE ~ "Low-Variation")) %>%
+  mutate(cluster = case_when(sewershed_analysis_name %in% visit_with_cluster$sewershed_analysis_name[visit_with_cluster$cluster=="Cluster 1"] ~ "Cluster 1",
+                             TRUE ~ "Cluster 2")) %>%
   rename(date = end_date) %>%
   select(date, sewershed_result_name, cluster, cor_pval_run) %>%
   arrange(sewershed_result_name)
@@ -106,7 +106,7 @@ rolling_corr_summary <- corr_df_long %>%
          #sd_corr = sd(cor_pval_run),
          #cov = sd_corr/mean_corr) %>%
   slice(1) %>%
-  mutate(strength = ifelse(prop > 0.5, "High Strength", "Low Strength"))           #abs(cov) < 1, "High Stability", "Low Stability"))
+  mutate(strength = ifelse(prop > 0.5, "High Strength", "Low Strength"))
 
 table(rolling_corr_summary$cluster, rolling_corr_summary$strength)
 
@@ -114,7 +114,6 @@ table(rolling_corr_summary$cluster, rolling_corr_summary$strength)
 rolling_corr_summary_id_strength <- rolling_corr_summary %>%
   ungroup() %>%
   arrange(prop) %>%
-  #group_by(sewershed_result_name) %>%
   mutate(id = match(sewershed_result_name, unique(sewershed_result_name)))
 
 plot_rolling_corr_strength <- ggplot(data = rolling_corr_summary_id_strength) +
@@ -123,7 +122,7 @@ plot_rolling_corr_strength <- ggplot(data = rolling_corr_summary_id_strength) +
   labs(x = "Percent of Rolling Correlation Values > 0.5", y = NULL) +
   scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1), labels = scales::percent) +
   scale_fill_manual(values = c("orange3", "dodgerblue3"),
-                    labels = c("High-Variation", "Low-Variation")) +
+                    labels = c("Cluster 1", "Cluster 2")) +
   guides(fill = guide_legend(title = "Mobility Cluster")) +
   theme(plot.title = element_text(hjust = 0.5),
         axis.title.x = element_text(margin = margin(t = 5)),
@@ -153,93 +152,37 @@ seasonal_summary <- seasonal %>%
 
 write.csv(seasonal_summary, "DataProcessed/seasonal_summary.csv")
 
-seasonal_high <- seasonal %>% filter(cluster == "High-Variation")
-seasonal_plot_high <- ggplot(data = seasonal_high, aes(x = season, y = cor_pval_run)) +
-  #geom_boxplot(aes(x = season, y = cor_pval_run), coef = Inf, staplewidth = 0.5, fill = "orange3") +
+seasonal1 <- seasonal %>% filter(cluster == "Cluster 1")
+seasonal_plot1 <- ggplot(data = seasonal1, aes(x = season, y = cor_pval_run)) +
   geom_violin(fill = "orange3", alpha = 0.7) +
   stat_summary(fun.data = "mean_cl_boot", geom = "pointrange") +
   labs(x = NULL, y = "Seasonal Rolling Correlation") +
-  ggtitle("High-Variation Sewersheds (n = 13)") +
+  ggtitle("Cluster 1 Sewersheds (n = 13)") +
   scale_y_continuous(limits = c(-1, 1)) +
   theme(plot.title = element_text(hjust = 0.5),
         axis.text.x = element_text(angle = 90, hjust = 0.95, vjust = 0.4),
         axis.title.y = element_text(margin = margin(l = 10, r = 5)),
         plot.margin = margin(15, 20, 10, 0, "pt"))
   
-seasonal_low <- seasonal %>% filter(cluster == "Low-Variation")
-seasonal_plot_low <- ggplot(data = seasonal_low, aes(x = season, y = cor_pval_run)) +
-  #geom_boxplot(aes(x = season, y = cor_pval_run), coef = Inf, staplewidth = 0.5, fill = "orange3") +
+seasonal2 <- seasonal %>% filter(cluster == "Cluster 2")
+seasonal_plot2 <- ggplot(data = seasonal2, aes(x = season, y = cor_pval_run)) +
   geom_violin(fill = "dodgerblue3", alpha = 0.7) +
   stat_summary(fun.data = "mean_cl_boot", geom = "pointrange") +
   labs(x = NULL, y = "Seasonal Rolling Correlation") +
-  ggtitle("Low-Variation Sewersheds (n = 53)") +
+  ggtitle("Cluster 2 Sewersheds (n = 53)") +
   scale_y_continuous(limits = c(-1, 1)) +
   theme(plot.title = element_text(hjust = 0.5),
         axis.text.x = element_text(angle = 90, hjust = 0.95, vjust = 0.4),
         axis.title.y = element_text(margin = margin(l = 10, r = 5)),
         plot.margin = margin(15, 20, 10, 0, "pt"))
 
-seasonal_plot <- grid.arrange(seasonal_plot_high, seasonal_plot_low, ncol = 2)
+seasonal_plot <- grid.arrange(seasonal_plot1, seasonal_plot2, ncol = 2)
 ggsave("Figures/seasonal_plot.png", height = 6, width = 14, plot = seasonal_plot)
 
-
-summary(aov(seasonal_high$cor_pval_run ~ seasonal_high$season))
-pairwise.t.test(seasonal_high$cor_pval_run, seasonal_high$season, p.adjust.method = "none")
-summary(aov(seasonal_low$cor_pval_run ~ seasonal_low$season))
-pairwise.t.test(seasonal_low$cor_pval_run, seasonal_low$season, p.adjust.method = "none")
-
-
-# ranked sewersheds by stability
-# rolling_corr_summary_id_stability <- rolling_corr_summary %>%
-#   ungroup() %>%
-#   arrange(iqr_corr) %>%
-#   #group_by(sewershed_result_name) %>%
-#   mutate(id = match(sewershed_result_name, unique(sewershed_result_name)))
-# 
-# plot_rolling_corr_stability <- ggplot(data = rolling_corr_summary_id_stability) +
-#   geom_bar(aes(x = iqr_corr, y = as.factor(id), fill = cluster), stat = "identity") +
-#   geom_vline(xintercept = 0.5, linetype = "dashed") +
-#   labs(x = "IQR of Rolling Correlation", y = NULL) +
-#   #scale_x_continuous(breaks = seq(0, 20, 2)) +
-#   scale_fill_manual(values = c("orange2", "darkorchid4"),
-#                     labels = c("High-Variation", "Low-Variation")) +
-#   guides(fill = guide_legend(title = "Mobility Cluster")) +
-#   theme(plot.title = element_text(hjust = 0.5),
-#         axis.title.x = element_text(margin = margin(t = 5)),
-#         axis.text.y = element_blank(),
-#         axis.ticks.y = element_blank())
-# 
-# ggsave("Figures/plot_rolling_corr_stability.png", width = 9, height = 9, plot = plot_rolling_corr_stability)
-# 
-# # spaghetti plot showing rolling correlations
-# 
-# rolling_corr_spaghetti_high <- ggplot(data = corr_df_long %>% filter(cluster == "High-Variation")) +
-#   geom_line(aes(x = date, y = cor_pval_run, group = sewershed_result_name,
-#                 color = sewershed_result_name), alpha = 0.4) +
-#   labs(x = "90-Day Rolling Window End Date", y = "Dynamic Spearman Correlation Coefficient") +
-#   ggtitle("High-Variation Sewersheds (n = 13)") +
-#   scale_x_date(limits = as.Date(c(min(corr_df_long$date), max(corr_df_long$date))),
-#                date_breaks = "4 months", date_labels = "%b %Y") +
-#   guides(color = "none") +
-#   theme(plot.title = element_text(hjust = 0.5),
-#         axis.title.x = element_text(margin = margin(t = 5)),
-#         axis.text.x = element_text(angle = 90, hjust = 0.95, vjust = 0.4))
-# 
-# rolling_corr_spaghetti_low <- ggplot(data = corr_df_long %>% filter(cluster == "Low-Variation")) +
-#   geom_line(aes(x = date, y = cor_pval_run, group = sewershed_result_name,
-#                 color = sewershed_result_name), alpha = 0.4) +
-#   labs(x = "90-Day Rolling Window End Date", y = "Dynamic Spearman Correlation Coefficient") +
-#   ggtitle("Low-Variation Sewersheds (n = 53)") +
-#   scale_x_date(limits = as.Date(c(min(corr_df_long$date), max(corr_df_long$date))),
-#                date_breaks = "4 months", date_labels = "%b %Y") +
-#   guides(color = "none") +
-#   theme(plot.title = element_text(hjust = 0.5),
-#         axis.title.x = element_text(margin = margin(t = 5)),
-#         axis.text.x = element_text(angle = 90, hjust = 0.95, vjust = 0.4))
-# 
-# rolling_corr_spaghetti <- grid.arrange(rolling_corr_spaghetti_high, rolling_corr_spaghetti_low)
-# 
-# ggsave("Figures/rolling_corr_spaghetti.png", height = 9, width = 11, plot = rolling_corr_spaghetti)
+summary(aov(seasonal1$cor_pval_run ~ seasonal1$season))
+pairwise.t.test(seasonal1$cor_pval_run, seasonal1$season, p.adjust.method = "none")
+summary(aov(seasonal2$cor_pval_run ~ seasonal2$season))
+pairwise.t.test(seasonal2$cor_pval_run, seasonal2$season, p.adjust.method = "none")
 
 ########################################################################################################
 
