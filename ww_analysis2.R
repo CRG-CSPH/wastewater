@@ -10,7 +10,7 @@ setwd("/Users/emwu9912/Documents/CU Anschutz/COVID Wastewater/")
 
 # load libraries
 library(pacman)
-p_load(distributional, EnvStats, ggdist, gridExtra, Hmisc, lme4, lubridate, tidyverse, viridis)
+p_load(distributional, EnvStats, ggdist, ggpubr, gridExtra, Hmisc, lme4, lubridate, tidyverse, viridis)
 
 #turn off scientific notation
 options(scipen = 999)
@@ -145,8 +145,18 @@ cdphe_flow <- cdphe_flow4 %>%
 
 save(cdphe_flow, file = "DataProcessed/cdphe_flow.Rda")
 
+cdphe_flow_monthly <- cdphe_flow %>%
+  group_by(cdphe_flow_name, reporting_month, reporting_year) %>%
+  rename(report_date = date) %>%
+  mutate(reporting_day = 1,
+         flow_rate_monthly = mean(flow_rate),
+         date = make_date(reporting_year, reporting_month, reporting_day)) %>%
+  slice(1) %>%
+  select(-report_date)
+
+
 # merge mobile device and flow data
-visit_with_flow <- merge(visit, cdphe_flow, c("date", "cdphe_flow_name"), all= T) %>%
+visit_with_flow <- merge(visit, cdphe_flow_monthly, c("date", "cdphe_flow_name"), all= T) %>%
   # restrict to sewersheds appearing in flow data
   filter(cdphe_flow_name %in% cdphe_flow$cdphe_flow_name) %>%
   # impute to check log transformation
@@ -201,7 +211,6 @@ for (i in seq_along(sewersheds_result)){
     geom_histogram(aes(x = flow_rate)) +
     labs(x = "Flow Rate", y = "Frequency (Sewershed-Days)") +
     ggtitle(sewersheds_result[i]) +
-    #scale_x_continuous(labels = scales::comma) +
     theme(plot.title = element_text(hjust = 0.5))
   ggsave(paste0("Figures/Flow Rate Distribution/", sewersheds_analysis[[i]], "_original.png"), height = 8, width = 8, sewershed_flow_dist[[i]])
 }
@@ -230,9 +239,6 @@ skewness_flow <- visit_with_flow %>%
 
 # 2x2 tables describing skew for flow data
 table(skewness_flow$normal_skewed_flow)
-# log-transforming does not change how many are normal vs. skewed
-# (but this is because some turn from skewed to normal and vice versa)
-# however, log-transform flow rates anyway to stay consistent with mobile device data
 table(skewness_flow$normal_skewed_flow_log)
 
 # log-transform device counts and flow rates
@@ -241,7 +247,7 @@ visit_with_flow_log <- visit_with_flow %>%
   mutate(total_devices_daily_log = log(total_devices_daily),
          total_devices_monthly_log = log(total_devices_monthly),
          internal_devices_monthly_log = log(internal_devices_monthly),
-         flow_rate_log = log(flow_rate))
+         flow_rate_log = log(flow_rate_monthly))
 
 # read in population data to compare device counts by year
 populations <- read.csv("DataRaw/co-est2024-pop-08.csv") %>%
@@ -462,6 +468,23 @@ spaghetti_plot2 <- ggplot(spaghetti2) +
         plot.margin = margin(10, 20, 10, 0, "pt"))
 
 spaghetti_cluster <- grid.arrange(spaghetti_plot1, spaghetti_plot2, ncol = 1)
+
+spaghetti <- visit_with_cluster %>%
+  group_by(cluster, sewershed_analysis_name, year) %>%
+  drop_na(total_devices_monthly_log) %>%
+  mutate(spaghetti_value = scale(total_devices_monthly_log))
+
+spaghetti_r01 <- ggplot(spaghetti) +
+  geom_line(aes(x = date, y = spaghetti_value, group = sewershed_analysis_name, color = cluster)) +
+  labs(x = NULL, y = "Normalized Monthly Device Count") +
+  scale_x_date(date_breaks = "4 months", date_labels = "%b %Y") +
+  scale_color_manual(values = c("orange3", "dodgerblue3")) +
+  guides(color = "none") +
+  facet_wrap(~cluster, ncol = 1) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0.95, vjust = 0.4),
+        strip.text.x = element_blank())
+
+ggsave("Figures/spaghetti_r01.png", height = 3, width = 8, plot = spaghetti_r01)
 
 # save spaghetti plot
 ggsave("Figures/spaghetti_cluster.png", height = 8, width = 10, plot = spaghetti_cluster)
