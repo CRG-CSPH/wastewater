@@ -5,313 +5,884 @@ setwd("/Users/emwu9912/Documents/CU Anschutz/Wastewater/")
 options(scipen = 999)
 
 library(pacman)
-p_load(DHARMa, FSA, glmmTMB, lme4, lubridate, MASS, performance, reformulas, slider, tidyverse, TMB)
+p_load(car, DHARMa, digest, FSA, glmmTMB, lme4, lmerTest, purrr, scales, sf, slider, tidycensus, tidyverse, tigris, zoo)
 
 theme <- theme(plot.title = element_text(hjust = 0.5),
                axis.title.x = element_text(margin = margin(t = 5)),
                axis.ticks.y = element_blank(),
                axis.text.x = element_text(angle = 90, hjust = 0.95, vjust = 0.4))
 
-sentinel <- read.csv("DataRaw/sentinel.csv")
-sewershed_names <- read.csv("DataRaw/sewershed_names.csv")
+ww_capacity <- read.csv("DataRaw/ww_capacity.csv") %>%
+  rename(utility = wwtp_name)
 
-visit <- read.csv("DataProcessed/2025_10_21_daily_visits.csv") %>%
+sentinel <- read.csv("DataRaw/sentinel.csv") %>%
+  arrange(category, utility) %>%
+  mutate(category_id = case_when(category == "High Tourism" ~ "HT",
+                                 category == "Metro" ~ "MP",
+                                 category == "Other Large" ~ "OL",
+                                 TRUE ~ "OS")) %>%
+  group_by(category_id) %>%
+  mutate(sewershed_id = row_number(),
+         sewershed_code = paste0(category_id, sewershed_id)) %>%
+  left_join(ww_capacity) %>%
+  mutate(TOTAL_DESIGN_FLOW_NMBR_10 = TOTAL_DESIGN_FLOW_NMBR*1.1)
+
+sewershed_names <- read.csv("DataRaw/sewershed_names.csv")
+sewershed_populations <- read.csv("DataProcessed/sewershed_populations.csv")
+
+# overlap <- read.csv("DataRaw/new_overlap_jan2025.csv") %>%
+#   rename(cdphe_flow_name = wwtp) %>%
+#   left_join(sewershed_names) %>%
+#   rename(utility = sewershed_sentinel_name)
+# 
+# assigned_cbgs <- overlap %>%
+#   mutate(GEOID = as.character(GEOID)) %>%
+#   group_by(GEOID) %>%
+#   arrange(desc(PERCENTAGE)) %>%
+#   slice(1) %>%
+#   filter(PERCENTAGE >= 0.2) %>%
+#   group_by(utility) %>%
+#   add_count() %>%
+#   filter(utility %in% sentinel$utility)
+#
+# cbg_2019 <- get_acs(geography = "block group",
+#                     variables = "B01003_001",
+#                     state = "CO",
+#                     year = 2019) %>%
+#   mutate(GEOID = str_remove(GEOID, "^0+")) %>%
+#   rename(pop_2019 = estimate) %>%
+#   select(GEOID, pop_2019)
+# 
+# sewershed_populations <- assigned_cbgs %>%
+#   left_join(cbg_2019) %>%
+#   group_by(utility) %>%
+#   rename(n_cbgs = n) %>%
+#   mutate(census_population = sum(pop_2019)) %>%
+#   slice(1) %>%
+#   select(utility, n_cbgs, census_population)
+
+#write.csv(sewershed_populations, "DataProcessed/sewershed_populations.csv")
+
+sentinel_with_populations <- left_join(sentinel, sewershed_populations)
+
+visit <- read.csv("DataProcessed/Mobile Device Data/2026_04_20_daily_visits.csv") %>%
   rename(cdphe_flow_name = DESTINATION_AREA_SEWERSHED,
          total_devices_daily = STOPS_BY_DAY_L) %>%
   mutate(date = as.Date(DAY)) %>%
   left_join(sewershed_names) %>%
   rename(utility = sewershed_sentinel_name) %>%
-  filter(#date >= "2024-09-30",
-         utility %in% sentinel$utility) %>%
+  filter(utility %in% sentinel$utility) %>%
   select(utility, date, total_devices_daily)
 
-# recover data from utilities with missing or zero flow
-flow_missing_impute <- read.csv("DataRaw/20251106_MissingFlowRates_CSPH.csv") %>%
-  mutate(date = as.Date(sample_collect_date, "%m/%d/%y")) %>%
-  rename(flow_rate_impute = flow_rate) %>%
-  select(utility, pcr_target, date, flow_rate_impute)
+targets <- c(FLUA = "fluav", RSV = "rsv", COVID = "sars-cov-2")
+titles <- c("Flu A", "RSV", "SARS-CoV-2")
+pcr_targets <- c("fluav", "rsv", "sars-cov-2")
 
-ww <- read.csv("DataRaw/2_CDPHE_Wastewater_Data_ 2025-08-04 .csv") %>%
-  # cleaning and formatting
-  mutate(utility = wwtp_name,
-         wwtp_name = tolower(wwtp_name),
+lp3_start <- "2024-09-30"
+
+ww1 <- read.csv("DataRaw/2026/CSPH_WWData_2026-02-26.csv") %>%
+  mutate(date = as.Date(sample_collect_date, "%m/%d/%y"),
+         dataset = 1) %>%
+  group_by(wwtp_name, sample_collect_date, pcr_target) %>%
+  # deduplicate
+  slice(1)
+
+ww2 <- read.csv("DataRaw/CSPH Data _ April 2026/CSPH_WWData_2026-04-13.csv") %>%
+  mutate(date = as.Date(sample_collect_date, "%m/%d/%y"),
+         dataset = 2) %>%
+  group_by(wwtp_name, sample_collect_date, pcr_target) %>%
+  # deduplicate
+  slice(1)
+
+ww <- bind_rows(ww1, ww2) %>%
+  rename(utility = wwtp_name) %>%
+  mutate(lod_sewage = 1200,
          pcr_target = tolower(pcr_target),
-         date = as.Date(sample_collect_date, "%Y-%m-%d"),
-         test_result_date = as.Date(test_result_date, "%Y-%m-%d")) %>%
+         # indicator variable for detect/non-detect
+         detect = ifelse(pcr_target_avg_conc <= lod_sewage, 0, 1),
+         # impute non-detects with half the LOD
+         pcr_target_avg_conc = ifelse(detect == 0, lod_sewage/2, pcr_target_avg_conc)) %>%
   filter(utility %in% sentinel$utility,
          pcr_target %in% c("fluav", "rsv", "sars-cov-2")) %>%
-         #date >= "2024-09-30") %>%
-  left_join(flow_missing_impute) %>%
-  # impute anything BLOD with half the LOD
-  mutate(pcr_target_avg_conc = case_when(pcr_target_avg_conc <= lod_sewage ~ lod_sewage/2,
-                                         TRUE ~ pcr_target_avg_conc),
-         # impute missing and zero flow rates with recovered data
-         flow_rate = case_when(flow_rate == 0 ~ flow_rate_impute,
-  # set remaining zero flow rates to missing
-  TRUE ~ flow_rate)) %>%
-  select(-flow_rate_impute) %>%
+  group_by(utility, pcr_target, date) %>%
+  # if repeated values from date overlap, select the more recent dataset
+  arrange(desc(dataset)) %>%
+  slice(1) %>%
+  left_join(sentinel_with_populations)
+
+# proportion of observations with missing or zero flow rates
+percent(sum(is.na(ww$flow_rate) | ww$flow_rate == 0, na.rm = TRUE)/nrow(ww), accuracy = 0.01)
+
+# impute missing or zero flow rates with the average of the last two non-missing nonzero flow rates
+ww_na_flow <- ww %>%
   group_by(utility, pcr_target) %>%
-  # impute the remaining missing flow rates with the average of the last two non-missing flow rates
-  mutate(flow_rate_last2avg = slide_dbl(flow_rate,
+  mutate(flow_rate = na_if(flow_rate, 0),
+         flow_rate_last2avg = slide_dbl(flow_rate,
                                         ~ mean(tail(na.omit(.x), 2)),
                                         .before = Inf,
                                         .complete = F),
          flow_rate = ifelse(is.na(flow_rate), flow_rate_last2avg, flow_rate)) %>%
-  select(-flow_rate_last2avg) %>%
-  left_join(sentinel)
+  select(-flow_rate_last2avg, -sample_collect_date, -population_served) %>%
+  left_join(sentinel_with_populations)
 
-ww_remove_outliers <- ww %>%
-  group_by(utility, pcr_target) %>%
-  arrange(date) %>%
-  mutate(roll_mean = cummean(pcr_target_avg_conc),
-         n = row_number(),
-         roll_var = cumsum((pcr_target_avg_conc - roll_mean)^2) / pmax(n - 1, 1),
-         roll_sd = sqrt(roll_var),
-         z = (pcr_target_avg_conc - roll_mean) / roll_sd) %>%
-  filter(abs(z) <= 4 | is.na(z))
+# proportion of observations where flow rate value exceeds max capacity
+percent(length(which(ww_na_flow$flow_rate > ww_na_flow$TOTAL_DESIGN_FLOW_NMBR_10))/nrow(ww_na_flow), accuracy = 0.01)
 
-write.csv(ww_remove_outliers, "DataProcessed/ww_remove_outliers.csv")
+# by sewershed
+above_capacity <- ww_na_flow %>%
+  filter(pcr_target == "sars-cov-2") %>%
+  mutate(above_capacity_flag = ifelse(flow_rate > TOTAL_DESIGN_FLOW_NMBR_10, "yes", "no")) %>%
+  group_by(utility) %>%
+  mutate(n_above = sum(above_capacity_flag == "yes"),
+         percent_above = round(n_above/n()*100, 1)) %>%
+  slice(1) %>%
+  select(utility, size, category, TOTAL_DESIGN_FLOW_NMBR_10, percent_above)
 
-desc <- ww_remove_outliers %>%
-  rename(capacity_based_population = population_served) %>%
-  select(lab_phase, wwtp_name, utility, category, capacity_based_population, census_population, pcr_target, sample_type, pcr_target_avg_conc, flow_rate, date, test_result_date, category) %>%
-  left_join(visit) %>%
-  mutate(flow_rate_per_capita = flow_rate*1000000/census_population,
-         device_count_per_capita = total_devices_daily/census_population,
-         ndays = as.numeric(difftime(test_result_date, date, units = "days")),
+ww_impute_flow <- ww_na_flow %>%
+  mutate(flow_rate = ifelse(flow_rate > TOTAL_DESIGN_FLOW_NMBR_10, TOTAL_DESIGN_FLOW_NMBR_10, flow_rate),
          week_end = ceiling_date(date, "weeks", week_start = getOption("lubridate.week.start", 6))) %>%
-  group_by(utility, pcr_target) %>%
-  mutate(mean_ndays = mean(ndays)) %>%
-  filter(date >= "2024-09-30") %>%
-  ungroup() %>%
-  arrange(desc(category), desc(utility)) %>%
-  mutate(utility_factor = factor(utility, unique(utility))) %>%
   group_by(utility, pcr_target, week_end) %>%
-  add_count()
+  add_count() %>%
+  rename(samp_freq = n) %>%
+  group_by(utility, pcr_target) %>%
+  arrange(category_id, sewershed_id)
 
-desc_covid <- desc %>%
-  filter(pcr_target == "sars-cov-2")
+ww_impute_flow$sewershed_code <- factor(ww_impute_flow$sewershed_code,
+                                        levels = c("HT1", "HT2", "HT3", "HT4", "HT5",
+                                                   "MP1", "MP2", "MP3", "MP4", "MP5",
+                                                   "OL1", "OL2", "OL3", "OL4", "OL5",
+                                                   "OL6", "OL7", "OS1", "OS2", "OS3"))
+  
+write.csv(ww_impute_flow, "DataProcessed/ww_impute_flow.csv") # output data for Python WVAL code
 
-boxplot_flow <- ggplot(data = desc_covid) +
-  geom_boxplot(aes(x = flow_rate_per_capita, y = utility_factor, group = utility, fill = category)) +
-  labs(x = "Daily Flow Rate Per Capita (gal)", y = NULL, fill = "Category") +
-  theme_bw() +
-  theme(panel.grid.major.y = element_blank(),
-        panel.grid.minor = element_blank()); boxplot_flow
+sampling_freq <- ww_impute_flow %>%
+  group_by(utility, pcr_target, week_end) %>%
+  slice(1)
 
-ggsave("Figures/boxplot_flow.png", height = 8, width = 14, plot = boxplot_flow)
+sample_freq_plot <- ggplot(data = sampling_freq %>% filter(pcr_target == "fluav")) +
+  geom_bar(aes(x = date, y = samp_freq), stat = "identity") +
+  labs(x = NULL, y = "Number of Samples Per Week") +
+  scale_y_continuous(limits = c(0, 3), breaks = seq(0, 3, 1)) +
+  facet_wrap(~utility, scales = "free") +
+  theme +
+  theme(axis.text.x = element_text(angle = 0)); sample_freq_plot
+ggsave("Figures/sample_freq_plot.png", height = 9, width = 17, plot = sample_freq_plot)
 
-boxplot_mobile <- ggplot(data = desc_covid) +
-  geom_boxplot(aes(x = device_count_per_capita, y = utility_factor, group = utility, fill = category)) +
-  labs(x = "Daily Device Count per Capita", y = NULL, fill = "Category") +
-  theme_bw() +
-  theme(panel.grid.major.y = element_blank(),
-        panel.grid.minor = element_blank()); boxplot_mobile
+sample_freq_plot_anon <- ggplot(data = sampling_freq %>% filter(pcr_target == "fluav")) +
+  geom_bar(aes(x = date, y = samp_freq), stat = "identity") +
+  labs(x = NULL, y = "Number of Samples Per Week") +
+  scale_y_continuous(limits = c(0, 3), breaks = seq(0, 3, 1)) +
+  facet_wrap(~sewershed_code, scales = "free") +
+  theme +
+  theme(axis.text.x = element_text(angle = 0)); sample_freq_plot_anon
+ggsave("Figures/sample_freq_plot_anon.png", height = 9, width = 17, plot = sample_freq_plot_anon)
 
-ggsave("Figures/boxplot_mobile.png", height = 8, width = 14, plot = boxplot_mobile)
+flow_rate_over_time <- ggplot(data = ww_impute_flow %>% filter(pcr_target == "fluav")) +
+  geom_point(aes(x = date, y = flow_rate, color = sample_type)) +
+  geom_line(aes(x = date, y = flow_rate)) +
+  geom_hline(aes(yintercept = TOTAL_DESIGN_FLOW_NMBR_10), linetype = "dashed") +
+  labs(x = NULL, y = "Flow Rate (MGD)", color = "Sample Type") +
+  facet_wrap(~utility, scales = "free") +
+  theme +
+  theme(axis.text.x = element_text(angle = 0)); flow_rate_over_time
 
-# Kruskal-Wallis test to determine if there are significant differences in
-# flow rate per capita or device count per capita between sewershed categories
-kruskal.test(flow_rate_per_capita ~ category, data = desc_covid) # p < 0.001 (significant differences)
-kruskal.test(device_count_per_capita ~ category, data = desc_covid) # p = 0.20 (no significant differences)
+ggsave("Figures/flow_rate_over_time.png", height = 9, width = 17, plot = flow_rate_over_time)
 
-# Dunn's test for pairwise comparisons (flow)
-dunnTest(flow_rate_per_capita ~ category, data = desc_covid,
-         method = "bonferroni")
-# High Tourism - Metro: p < 0.001
-# High Tourism - Other: p < 0.001
-# Metro - Other: p = 0.019
-# all significantly different from one another
+flow_rate_over_time_anon <- ggplot(data = ww_impute_flow %>% filter(pcr_target == "fluav")) +
+  geom_point(aes(x = date, y = flow_rate, color = sample_type)) +
+  geom_line(aes(x = date, y = flow_rate)) +
+  geom_hline(aes(yintercept = TOTAL_DESIGN_FLOW_NMBR_10), linetype = "dashed") +
+  labs(x = NULL, y = "Flow Rate (MGD)", color = "Sample Type") +
+  facet_wrap(~sewershed_code, scales = "free") +
+  theme +
+  theme(axis.text.x = element_text(angle = 0)); flow_rate_over_time_anon
 
-# sampling frequency dataset
-samp_freq <- desc %>% slice(1)
+ggsave("Figures/flow_rate_over_time_anon.png", height = 9, width = 17, plot = flow_rate_over_time_anon)
 
-titles <- c("SARS-CoV-2", "Flu A", "RSV")
-pcr_targets <- c("sars-cov-2", "fluav", "rsv")
-sample_type_plot <- list()
+device_count_over_time <- ggplot(data = visit %>% filter(date >= lp3_start)) +
+  geom_line(aes(x = date, y = total_devices_daily), color = "purple3") +
+  labs(x = NULL, y = "Daily Device Count") +
+  scale_y_continuous(labels = scales::comma) +
+  facet_wrap(~utility, scales = "free") +
+  theme +
+  theme(axis.text.x = element_text(angle = 0)); device_count_over_time
+
+ggsave("Figures/device_count_over_time.png", height = 9, width = 17, plot = device_count_over_time)
+
+# proportion of total observations that are non-detects
+below_lod <- ww_impute_flow %>%
+  mutate(below_lod_flag = pcr_target_below_lod == "yes") %>%
+  group_by(utility, pcr_target) %>%
+  summarise(n_obs = n(),
+            pct_below_lod = mean(below_lod_flag, na.rm = TRUE)*100,
+            .groups = "drop_last") %>%
+  ungroup()
+
+write.csv(below_lod, "DataProcessed/below_lod.csv")
+
+# does detection differ significantly by sample collection method (grab/24-hour)?
+detect_table <- table(ww_impute_flow$sample_type, ww_impute_flow$detect)
+detect_table
+detect_test <- chisq.test(detect_table)
+print(detect_test) # p = 0.19, does not differ significantly by collection method
+
+plot_seasonal <- list()
 for(i in 1:length(titles)){
-  sample_type_plot[[i]] <- ggplot(data = desc %>% filter(pcr_target == pcr_targets[i])) +
-                                  #aes(x = date, y = flow_rate_per_capita, color = sample_type)) +
-    geom_point(aes(x = date, y = flow_rate_per_capita, color = sample_type)) +
-    geom_line(aes(x = date, y = flow_rate_per_capita)) +
-    labs(x = NULL, y = "Daily Flow Rate per Capita (gal)", color = "Sample Type") +
-    ggtitle(paste("Flow Rate by Sampling Technique,", titles[i])) +
-    facet_wrap(~utility, scales = "free") +
-    theme +
-    theme(axis.text.x = element_text(angle = 0))
-  ggsave(paste0("Figures/sample_type_plot_", pcr_targets[i], ".png"), width = 17, height = 9, plot = sample_type_plot[[i]])
+  plot_seasonal[[i]] <- ggplot(data = ww_impute_flow %>% filter(pcr_target == pcr_targets[i])) +
+    geom_line(aes(x = date, y = pcr_target_avg_conc/1000, group = utility), color = "darkblue", alpha = 0.2) +
+    labs(x = NULL, y = "Raw Concentration (1000s copies/L") +
+    ggtitle(titles[i]) +
+    scale_x_date(limits = as.Date(c("2024-09-15", "2026-03-31")), date_labels = "%b %d %Y", date_breaks = "2 months") +
+    scale_y_continuous(labels = scales::comma) +
+    theme
+  ggsave(paste0("Figures/plot_seasonal_", pcr_targets[i], ".png"), width = 8, height = 5, plot = plot_seasonal[[i]])
 }
 
-sample_freq_plot <- list()
-for(i in 1:length(titles)){
-  sample_freq_plot[[i]] <- ggplot(data = samp_freq %>% filter(pcr_target == pcr_targets[i])) +
-    geom_bar(aes(x = week_end, y = n), stat = "identity") +
-    labs(x = NULL, y = "Number of Times Sampled Per Week") +
-    scale_y_continuous(limits = c(0, 3), breaks = seq(0, 3, 1)) +
-    ggtitle(paste("Sampling Frequency,", titles[i])) +
-    facet_wrap(~utility, scales = "free") +
-    theme +
-    theme(axis.text.x = element_text(angle = 0))
-  ggsave(paste0("Figures/sample_freq_plot_", pcr_targets[i], ".png"), width = 15, height = 9, plot = sample_freq_plot[[i]])
-}
+resp_season_start1 <- "2024-10-01"
+resp_season_end1 <- "2025-05-15"
+resp_season_start2 <- "2025-10-01"
+resp_season_end2 <- "2026-03-31"
 
-sample_ndays_plot <- list()
-for(i in 1:length(titles)){
-  sample_ndays_plot[[i]] <- ggplot(data = desc %>% filter(pcr_target == pcr_targets[i])) +
-    geom_bar(aes(x = date, y = ndays), stat = "identity") +
-    geom_line(aes(x = date, y = mean_ndays), color = "red") +
-    labs(x = NULL, y = "Number of Days") +
-    scale_y_continuous(limits = c(0, 21), breaks = seq(0, 21, 3)) +
-    ggtitle(paste("Number of Days Between Sample Collection and Test Result,", titles[i])) +
-    facet_wrap(~utility, scales = "free") +
-    theme +
-    theme(axis.text.x = element_text(angle = 0))
-  ggsave(paste0("Figures/sample_ndays_plot_", pcr_targets[i], ".png"), width = 15, height = 9, plot = sample_ndays_plot[[i]])
-}
-
-targets <- c(COVID = "sars-cov-2",
-             FLUA = "fluav",
-             RSV = "rsv")
-
+# read in Python WVAL output
 wval <- imap_dfr(targets , ~ {
-  read.csv(glue::glue("DataProcessed/2025_12_04_dataset/2025_12_04_{.y}_wval.csv")) %>%
+  read.csv(glue::glue("DataProcessed/WVAL/2026_04_21_dataset/2026_04_21_{.y}_wval_noagg.csv")) %>%
     mutate(pcr_target = .x,
-           week_end = as.Date(week_end, "%Y-%m-%d")) %>%
-    rename(WVAL_conc_weekly = WVAL) %>%
-    select(week_end, wwtp_name, pcr_target, WVAL_conc_weekly)
+           date = as.Date(sample_collect_date, "%Y-%m-%d")) %>%
+    rename(utility = wwtp_name) %>%
+    select(date, pcr_target, utility, WVAL)
 })
 
-ww_weekly <- desc %>%
+# generate normalized wastewater concentration dataset
+ww_norm <- ww_impute_flow %>%
+  left_join(visit) %>%
+  # restrict dates to start of Lab Phase 3 and end of mobile device data
+  filter(date >= lp3_start,
+         date <= max(visit$date)) %>%
+  # calculate normalized concentrations (units are in copies/person)
   group_by(utility, pcr_target) %>%
-  rename(raw_conc = pcr_target_avg_conc) %>%
-  mutate(flow_norm_conc = raw_conc*flow_rate,
-         mobile_norm_conc = raw_conc/total_devices_daily,
-         combo_norm_conc = raw_conc*(flow_rate/total_devices_daily)) %>%
-  # aggregate to weekly
+  # apply seasonal restriction for flu and RSV
+  mutate(season = case_when(date >= resp_season_start1 & date <= resp_season_end1 ~ "respiratory season",
+                            date >= resp_season_start2 & date <= resp_season_end2 ~ "respiratory season",
+                            TRUE ~ "off-season"),
+         detect_seasonal = case_when(pcr_target %in% c("fluav", "rsv") & season == "respiratory season" ~ detect,
+                                     pcr_target == "sars-cov-2" ~ detect,
+                                     TRUE ~ NA_integer_),
+         raw_conc = pcr_target_avg_conc/1000,
+         flow_rate_L = flow_rate*3.785*1000000,
+         flow_rate_ML = flow_rate*378.541,
+         ww_use = 265,
+         flow_norm_conc = signif(raw_conc*flow_rate_ML/census_population, 3),
+         mobile_norm_conc = signif(raw_conc/total_devices_daily*ww_use, 3),
+         combo_norm_conc = signif(raw_conc*(flow_rate_ML/total_devices_daily), 3)) %>%
+  left_join(wval) %>%
+  select(-pcr_target_avg_conc)
+
+# proportion of missing WVAL
+percent(sum(is.na(ww_norm$WVAL))/nrow(ww_norm), accuracy = 0.01)
+
+ww_norm_fill <- ww_norm %>%
+  group_by(utility) %>%
+  fill(WVAL, .direction = "down") %>%
+  rename(WVAL_conc = WVAL) %>%
+  mutate(WVAL_conc = signif(WVAL_conc, 3)) %>%
+  select(utility, size, category_id, sewershed_id, sewershed_code, pcr_target, category, sample_type,
+         date, week_end, flow_rate_L, flow_rate_ML, total_devices_daily, detect, detect_seasonal, census_population, contains("conc"))
+
+ww_norm_fill_seasonal <- ww_norm_fill %>%
+  drop_na(detect_seasonal)
+
+desc <- ww_norm_fill_seasonal %>%
+  ungroup() %>%
+  arrange(desc(category), desc(utility)) %>%
+  mutate(utility_factor = factor(utility, unique(utility)),
+         category_factor = factor(category, unique(category)),
+         sewershed_code_factor = factor(sewershed_code, unique(sewershed_code)))
+
+boxplot_flow_anon <- ggplot(data = desc %>% filter(pcr_target == "sars-cov-2")) +
+  geom_boxplot(aes(x = flow_rate_L/census_population, y = sewershed_code_factor,
+                   group = utility_factor, fill = category)) +
+  labs(x = "Daily Flow Rate Per Capita (L)", y = NULL, fill = "Category") +
+  scale_x_continuous(breaks = seq(0, 1500, 250), labels = scales::comma) +
+  theme_bw() +
+  theme(panel.grid.major.y = element_blank()); boxplot_flow_anon
+
+ggsave("Figures/boxplot_flow_anon.png", height = 5, width = 9, plot = boxplot_flow_anon)
+
+boxplot_mobile_anon <- ggplot(data = desc %>% filter(pcr_target == "sars-cov-2")) +
+  geom_boxplot(aes(x = total_devices_daily/census_population, y = sewershed_code_factor,
+                   group = utility_factor, fill = category)) +
+  labs(x = "Daily Device Count Per Capita", y = NULL, fill = "Category") +
+  scale_x_continuous(breaks = seq(0, 30, 5)) +
+  theme_bw() +
+  theme(panel.grid.major.y = element_blank()); boxplot_mobile_anon
+
+ggsave("Figures/boxplot_mobile_anon.png", height = 5, width = 9, plot = boxplot_mobile_anon)
+
+
+norm_names <- c("Raw Concentration", "Flow-Normalized Concentration", "Mobile Device-Normalized Concentration",
+                "Combination-Normalized Concentration", "WVAL")
+desc_long <- desc %>%
+  pivot_longer(cols = c(raw_conc, flow_norm_conc, mobile_norm_conc, combo_norm_conc, WVAL_conc),
+               names_to = "norm_method", values_to = "value")
+
+norm_methods <- desc_long$norm_method[1:5]
+
+facet_names_pathogens <- c("fluav" = "Flu A", "rsv" = "RSV", "sars-cov-2" = "SARS-CoV-2")
+
+boxplots <- list()
+for(i in 1:length(norm_methods)){
+  boxplots[[i]] <- ggplot(data = desc_long %>% filter(norm_method == norm_methods[i])) +
+    geom_boxplot(aes(x = log10(value), y = utility_factor, group = utility_factor, fill = category_factor)) +
+    labs(x = paste0("log(", norm_names[i], ")"), y = NULL, fill = "Category") +
+    guides(fill = guide_legend(reverse = TRUE)) +
+    facet_grid(~pcr_target, scales = "free", labeller = as_labeller(facet_names_pathogens)) +
+    theme(plot.title = element_text(hjust = 0.5),
+          strip.text = element_text(size = 12))
+  ggsave(paste0("Figures/boxplots_", norm_methods[i], ".png"), height = 8, width = 15, plot = boxplots[[i]])
+}
+
+norm_order <- c("raw_conc", "flow_norm_conc", "mobile_norm_conc", "combo_norm_conc", "WVAL_conc")
+
+summary_table <- desc %>%
+  rename(raw = raw_conc,
+         flow = flow_norm_conc,
+         mobile = mobile_norm_conc,
+         combo = combo_norm_conc,
+         WVAL = WVAL_conc) %>%
+  group_by(pcr_target, category) %>%
+  summarize(detect_freq = percent(mean(detect_seasonal, na.rm = TRUE), accuracy = 0.1),
+            across(c(raw, flow, mobile, combo, WVAL),
+                   list(median = median,
+                        iqr = IQR),
+                   .names = "{.fn}_{.col}")) %>%
+  mutate(across(where(is.numeric), ~ signif(.x, 3)))
+
+write.csv(summary_table, "DataProcessed/summary_table.csv")
+
+# aggregate to weekly timestep
+ww_norm_weekly <- ww_norm_fill_seasonal %>%
   group_by(utility, pcr_target, week_end) %>%
-  mutate(raw_conc_weekly = median(raw_conc),
-         flow_norm_conc_weekly = median(flow_norm_conc),
-         mobile_norm_conc_weekly = median(mobile_norm_conc),
-         combo_norm_conc_weekly = median(combo_norm_conc)) %>%
+  mutate(across(c(raw_conc, flow_norm_conc, mobile_norm_conc, combo_norm_conc, WVAL_conc),
+                mean, .names = "{.col}_weekly"),
+         detect_weekly = as.numeric(any(detect_seasonal == 1))) %>%
   slice(1) %>%
-  left_join(wval)
+  select(utility, size, category_id, sewershed_id, sewershed_code, pcr_target,
+         category, census_population, week_end, contains("week"))
 
-hosp_covid <- read.csv("DataRaw/CSPH/20251006_COVID_agg.csv") %>%
-  filter(Region.Level == "Sewershed")
+ww_norm_weekly_long <- ww_norm_weekly %>%
+  pivot_longer(c(contains("conc")), names_to = "norm_method", values_to = "value") %>%
+  ungroup() %>%
+  arrange(category_id, sewershed_id) %>%
+  mutate(sewershed_code_factor = factor(sewershed_code, unique(sewershed_code))) %>%
+  group_by(utility, pcr_target, norm_method) %>%
+  mutate(value_z = scale(value))
 
-hosp_flu <- read.csv("DataRaw/CSPH/20250926_Flu_agg.csv") %>%
-  filter(Region.Level == "Sewershed",
-         Pathogen.Name == "INFLUENZA A")
+plot_norm_methods_anon <- list()
+for(i in 1:length(titles)){
+  plot_norm_methods_anon[[i]] <- ggplot(data = ww_norm_weekly_long %>% filter(pcr_target == pcr_targets[i])) +
+    geom_line(aes(x = week_end, y = value_z, group = norm_method, color = norm_method)) +
+    labs(x = "Week End Date", y = "Z-Scored Value", color = "Normalization Method") +
+    scale_x_date(date_labels = "%b %Y") +
+    scale_color_manual(labels = c("Combination-Normalized", "Flow-Normalized",
+                                  "Mobile Device-Normalized", "Raw Concentration",
+                                  "WVAL"),
+                       values = c("violet", "turquoise2", "firebrick",
+                                  "darkorchid4", "orange")) +
+    guides(color = guide_legend(override.aes = list(linewidth = 8), nrow = 5)) +
+    facet_wrap(~sewershed_code_factor, scales = "free_y") +
+    theme
+  ggsave(paste0("Figures/plot_norm_methods_anon_", pcr_targets[i], ".png"), width = 12, height = 6, plot = plot_norm_methods_anon[[i]])
+}
 
-hosp_rsv <- read.csv("DataRaw/CSPH/20250922_RSV_agg.csv") %>%
-  filter(Region.Level == "Sewershed") %>%
-  group_by(Region.Name, Event.Onset.Date) %>%
+# read in hospital admissions data
+hosp_covid1 <- read.csv("DataRaw/2026/COVID_agg.csv") %>%
+  mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
+         dataset = 1)
+
+hosp_covid2 <- read.csv("DataRaw/CSPH Data _ April 2026/COVID_agg_April_update.csv") %>%
+  mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
+         dataset = 2)
+
+hosp_covid <- bind_rows(hosp_covid1, hosp_covid2) %>%
+  mutate(Region.Name = case_when(Region.Level == "County" ~ paste(Region.Name, "County"),
+                                 TRUE ~ Region.Name)) %>%
+  select(-Case.Count) %>%
+  pivot_wider(names_from = Region.Level, values_from = Hospitalized.Count) %>%
+  mutate(pcr_target = "sars-cov-2") %>%
+  rename(county_hosps = County,
+         sewershed_hosps = Sewershed) %>%
+  select(-Pathogen.Name, -Event.Onset.Date)
+
+hosp_covid_county <- hosp_covid %>%
+  filter(Region.Name %in% sentinel$county) %>%
+  select(-sewershed_hosps) %>%
+  rename(county = Region.Name)
+
+hosp_covid_sewershed <- hosp_covid %>%
+  filter(Region.Name %in% sentinel$utility[sentinel$size == "Small"]) %>%
+  select(-county_hosps) %>%
+  rename(utility = Region.Name)
+
+hosp_covid_small <- sentinel_with_populations %>%
+  filter(size == "Small") %>%
+  left_join(hosp_covid_county) %>%
+  left_join(hosp_covid_sewershed) %>%
+  ungroup() %>%
+  select(utility, county, size, pcr_target, date, county_hosps, sewershed_hosps)
+
+hosp_covid_model <- hosp_covid %>%
+  filter(Region.Name %in% sentinel$utility[sentinel$size == "Large"]) %>%
+  mutate(size = "Large") %>%
+  rename(utility = Region.Name) %>%
+  select(utility, size, pcr_target, date, county_hosps, sewershed_hosps) %>%
+  bind_rows(hosp_covid_small)
+
+hosp_flu1 <- read.csv("DataRaw/2026/Flu_agg.csv") %>%
+  filter(Pathogen.Name == "INFLUENZA A") %>%
+  mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
+         dataset = 1)
+
+hosp_flu2 <- read.csv("DataRaw/CSPH Data _ April 2026/Flu_agg_April_update.csv") %>%
+  filter(Pathogen.Name == "INFLUENZA A") %>%
+  mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
+         dataset = 2)
+
+hosp_flu <- bind_rows(hosp_flu1, hosp_flu2) %>%
+  mutate(Region.Name = case_when(Region.Level == "County" ~ paste(Region.Name, "County"),
+                                 TRUE ~ Region.Name)) %>%
+  pivot_wider(names_from = Region.Level, values_from = Hospitalized.Count) %>%
+  mutate(pcr_target = "fluav") %>%
+  rename(county_hosps = County,
+         sewershed_hosps = Sewershed) %>%
+  select(-Pathogen.Name, -Event.Onset.Date)
+
+hosp_flu_county <- hosp_flu %>%
+  filter(Region.Name %in% sentinel$county) %>%
+  select(-sewershed_hosps) %>%
+  rename(county = Region.Name)
+
+hosp_flu_sewershed <- hosp_flu %>%
+  filter(Region.Name %in% sentinel$utility[sentinel$size == "Small"]) %>%
+  select(-county_hosps) %>%
+  rename(utility = Region.Name)
+
+hosp_flu_small <- sentinel_with_populations %>%
+  filter(size == "Small") %>%
+  left_join(hosp_flu_county) %>%
+  left_join(hosp_flu_sewershed) %>%
+  ungroup() %>%
+  add_row(utility = "Telluride", county = "San Miguel County", size = "Small", pcr_target = "fluav",
+          date = as.Date("2026-01-31"), county_hosps = 0, sewershed_hosps = 0) %>%
+  select(utility, county, size, pcr_target, date, county_hosps, sewershed_hosps)
+
+hosp_flu_model <- hosp_flu %>%
+  filter(Region.Name %in% sentinel$utility[sentinel$size == "Large"]) %>%
+  mutate(size = "Large") %>%
+  rename(utility = Region.Name) %>%
+  select(utility, size, pcr_target, date, county_hosps, sewershed_hosps) %>%
+  bind_rows(hosp_flu_small)
+
+hosp_rsv1 <- read.csv("DataRaw/2026/RSV_agg.csv") %>%
+  group_by(Region.Level, Region.Name, Event.Onset.Date) %>%
   mutate(Hospitalized.Count = sum(Hospitalized.Count)) %>%
   slice(1) %>%
-  select(-Age.Group)
-
-hosp <- bind_rows(hosp_covid, hosp_flu, hosp_rsv) %>%
+  select(-Age.Group) %>%
   mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
-         pcr_target = case_when(Pathogen.Name == "INFLUENZA A" ~ "fluav",
-                                Pathogen.Name == "RESPIRATORY SYNCYTIAL VIRUS" ~ "rsv",
-                                TRUE ~ "sars-cov-2"),
-         week_end = ceiling_date(date, "weeks", week_start = getOption("lubridate.week.start", 6))) %>%
-  rename(utility = Region.Name,
-         admissions = Hospitalized.Count) %>%
-  select(utility, pcr_target, date, week_end, admissions) %>%
-  filter(date >= "2024-09-30")
+         dataset = 1)
+
+hosp_rsv2 <- read.csv("DataRaw/CSPH Data _ April 2026/RSV_agg_April_update.csv") %>%
+  group_by(Region.Level, Region.Name, Event.Onset.Date) %>%
+  mutate(Hospitalized.Count = sum(Hospitalized.Count)) %>%
+  slice(1) %>%
+  select(-Age.Group) %>%
+  mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
+         dataset = 2)
+
+hosp_rsv <- bind_rows(hosp_rsv1, hosp_rsv2) %>%
+  mutate(Region.Name = case_when(Region.Level == "County" ~ paste(Region.Name, "County"),
+                                 TRUE ~ Region.Name)) %>%
+  pivot_wider(names_from = Region.Level, values_from = Hospitalized.Count) %>%
+  mutate(pcr_target = "rsv") %>%
+  rename(county_hosps = County,
+         sewershed_hosps = Sewershed) %>%
+  ungroup() %>%
+  select(-Pathogen.Name, -Event.Onset.Date)
+
+hosp_rsv_county <- hosp_rsv %>%
+  filter(Region.Name %in% sentinel$county) %>%
+  select(-sewershed_hosps) %>%
+  rename(county = Region.Name)
+
+hosp_rsv_sewershed <- hosp_rsv %>%
+  filter(Region.Name %in% sentinel$utility[sentinel$size == "Small"]) %>%
+  select(-county_hosps) %>%
+  rename(utility = Region.Name)
+
+hosp_rsv_small <- sentinel_with_populations %>%
+  filter(size == "Small") %>%
+  left_join(hosp_rsv_county) %>%
+  left_join(hosp_rsv_sewershed) %>%
+  ungroup() %>%
+  select(utility, county, size, pcr_target, date, county_hosps, sewershed_hosps)
+
+hosp_rsv_model <- hosp_rsv %>%
+  filter(Region.Name %in% sentinel$utility[sentinel$size == "Large"]) %>%
+  mutate(size = "Large") %>%
+  rename(utility = Region.Name) %>%
+  select(utility, size, pcr_target, date, county_hosps, sewershed_hosps) %>%
+  bind_rows(hosp_rsv_small)
+
+hosp_small <- bind_rows(hosp_covid_small, hosp_flu_small, hosp_rsv_small) %>%
+  drop_na(pcr_target) %>%
+  replace(is.na(.), 0) %>%
+  filter(date >= lp3_start,
+         date <= max(visit$date))
+
+plot_hosp_small_sewershed <- list()
+for(i in 1:length(titles)){
+  plot_hosp_small_sewershed[[i]] <- ggplot(data = hosp_small %>% filter(pcr_target == pcr_targets[i])) +
+    geom_bar(aes(x = date, y = sewershed_hosps), stat = "identity") +
+    labs(x = NULL, y = "Daily Hospital Admissions") +
+    ggtitle(paste(titles[i], "Hospital Admissions Over Time")) +
+    scale_x_date(date_labels = "%b %Y") +
+    facet_wrap(~utility, scales = "free_y") +
+    theme
+  ggsave(paste0("Figures/plot_hosp_small_sewershed_", pcr_targets[i], ".png"), width = 17, height = 9, plot = plot_hosp_small_sewershed[[i]])
+}
+
+plot_hosp_small_county <- list()
+for(i in 1:length(titles)){
+  plot_hosp_small_county[[i]] <- ggplot(data = hosp_small %>% filter(pcr_target == pcr_targets[i])) +
+    geom_bar(aes(x = date, y = county_hosps), stat = "identity") +
+    labs(x = NULL, y = "Daily Hospital Admissions") +
+    ggtitle(paste(titles[i], "Hospital Admissions Over Time")) +
+    scale_x_date(date_labels = "%b %Y") +
+    facet_wrap(~county, scales = "free_y") +
+    theme
+  ggsave(paste0("Figures/plot_hosp_small_county_", pcr_targets[i], ".png"), width = 17, height = 9, plot = plot_hosp_small_county[[i]])
+}
+
+hosp_small_table <- hosp_small %>%
+  group_by(utility, pcr_target) %>%
+  summarize(total_sewershed_hosps = sum(sewershed_hosps),
+            total_county_hosps = sum(county_hosps))
+
+write.csv(hosp_small_table, "DataProcessed/hosp_small_table.csv")
+
+hosp <- bind_rows(hosp_covid_model, hosp_flu_model, hosp_rsv_model) %>%
+  drop_na(pcr_target) %>%
+  mutate(admissions = ifelse(is.na(county), sewershed_hosps, county_hosps)) %>%
+  select(utility, size, pcr_target, date, admissions) %>%
+  filter(date >= lp3_start,
+         date <= max(visit$date))
 
 hosp_weekly <- hosp %>%
   mutate(week_end = ceiling_date(date, "weeks", week_start = getOption("lubridate.week.start", 6))) %>%
   group_by(utility, pcr_target, week_end) %>%
   mutate(admissions_weekly = sum(admissions)) %>%
   slice(1) %>%
-  select(-c(admissions, date))
+  select(-date, -admissions)
 
-ww_hosp_weekly <- merge(ww_weekly, hosp_weekly, c("pcr_target", "utility", "week_end"), all = T) %>%
-  filter(utility %in% sentinel$utility) %>%
-  mutate(admissions_weekly = replace_na(admissions_weekly, 0)) %>%
-  group_by(utility, pcr_target) %>%
-  fill(category, census_population, raw_conc_weekly, flow_norm_conc_weekly,
-       mobile_norm_conc_weekly, combo_norm_conc_weekly, WVAL_conc_weekly) %>%
-  # create lagged variables
-  mutate(admissions_weekly_w_1 = lag(admissions_weekly, 1)) %>%
-  mutate(across(c(raw_conc_weekly, flow_norm_conc_weekly, mobile_norm_conc_weekly,
-                  combo_norm_conc_weekly, WVAL_conc_weekly),
-                list(w_1 = ~lag(.x, 1)),
-                .names = "{.col}_{.fn}")) %>%
-  select(utility, category, census_population, pcr_target, date, contains("week"))
+ww_hosp_weekly <- merge(ww_norm_weekly, hosp_weekly, c("utility", "size", "pcr_target", "week_end"), all = TRUE) %>%
+  # drop weeks with a value for hospital admissions but not wastewater
+  drop_na(category) %>%
+  mutate(admissions_weekly = replace_na(admissions_weekly, 0))
 
-write.csv(ww_hosp_weekly, "DataProcessed/ww_hosp_weekly.csv")
+# set up dataset for cross_correlation
+cross_corr <- ww_hosp_weekly %>%
+  filter(utility %in% c("Metro Wastewater RWHTF - PRC", "Aurora", "CO Springs - Las Vegas")) %>%
+  select(week_end, pcr_target, raw_conc_weekly, admissions_weekly) %>%
+  group_by(pcr_target, week_end) %>%
+  mutate(ww = mean(raw_conc_weekly),
+         hosp = sum(admissions_weekly)) %>%
+  slice(1) %>%
+  pivot_wider(id_cols = week_end, names_from = pcr_target,
+              values_from = c(ww, hosp)) %>%
+  replace(is.na(.), 0)
 
-scatter <- list()
-for(i in 1:length(titles)){
-  scatter[[i]] <- ggplot(data = ww_hosp_weekly %>% filter(pcr_target == pcr_targets[i]),
-                         aes(x = raw_conc_weekly, y = admissions_weekly)) +
-    geom_point() +
-    geom_smooth(method = "glm.nb", se = TRUE, color = "blue") +
-    labs(x = "Weekly Raw Concentration (copies/L)", y = "Weekly Total Hospital Admissions (n)") +
-    ggtitle(paste(titles[i], "Hospital Admissions vs. Raw Viral Concentrations")) +
-    scale_x_continuous(labels = scales::comma) +
-    facet_wrap(~utility, scales = "free") +
-    theme +
-    theme(axis.text.x = element_text(angle = 0))
-  ggsave(paste0("Figures/scatter_", pcr_targets[i], ".png"), width = 15, height = 9, plot = scatter[[i]])
+find_best_lag <- function(ww, hosp, max_lag = 4){
+  
+  df <- tibble(ww = ww, hosp = hosp) %>%
+    filter(!is.na(ww), !is.na(hosp))
+  
+  if(nrow(df) == 0){
+    stop("No complete observations remain after filtering.")
+  }
+  
+  ccf_result <- ccf(x = df$ww, y = df$hosp,
+                    lag.max = max_lag, plot = FALSE)
+  
+  tibble(lag = as.numeric(ccf_result$lag),
+         correlation = as.numeric(ccf_result$acf)) %>%
+    filter(lag >= 0) %>%
+    arrange(desc(abs(correlation)))
 }
 
-ww_hosp_weekly_scale <- ww_hosp_weekly %>%
+lag_results <- bind_rows(fluav = find_best_lag(cross_corr$ww_fluav, cross_corr$hosp_fluav),
+                     rsv = find_best_lag(cross_corr$ww_rsv, cross_corr$hosp_rsv),
+                     `sars-cov-2` = find_best_lag(cross_corr$`ww_sars-cov-2`, cross_corr$`hosp_sars-cov-2`),
+                     .id = "pcr_target")
+
+write.csv(lag_results, "DataProcessed/lag_results.csv")
+
+# test the data in a negative binomial model to see if log-transforming improves the
+# residual structure around the fitted values
+library(MASS)
+m_orig <- glm.nb(admissions_weekly ~ raw_conc_weekly + detect_weekly,
+                 data = ww_hosp_weekly)
+
+m_log <- glm.nb(admissions_weekly ~ log10(raw_conc_weekly) + detect_weekly,
+                data = ww_hosp_weekly)
+
+plot_df <- bind_rows(tibble(fitted = fitted(m_orig),
+                            residual = residuals(m_orig, type = "pearson"),
+                            model = "Original"),
+                     tibble(fitted = fitted(m_log),
+                            residual = residuals(m_log, type = "pearson"),
+                            model = "Log-Transformed"))
+
+residuals <- ggplot(plot_df, aes(fitted, residual)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess",
+              se = FALSE) +
+  facet_wrap(~fct_rev(model)) +
+  geom_hline(yintercept = 0, linetype = 2); residuals
+
+sim_orig <- simulateResiduals(m_orig)
+sim_log <- simulateResiduals(m_log)
+
+testDispersion(sim_orig)
+testDispersion(sim_log)
+
+testUniformity(sim_orig)
+testUniformity(sim_log)
+
+AIC(m_orig, m_log)
+
+detach("package:MASS")
+
+ww_hosp_model <- ww_hosp_weekly %>%
+  mutate(utility = as.factor(utility)) %>%
+  #mutate(across(contains("conc"), log10, .names = "log_{.col}")) %>%
   group_by(utility, pcr_target) %>%
-  mutate(across(contains("conc"), scale)) %>%
-  select(-date) %>%
-  drop_na()
+  #mutate(across(contains("conc"), ~ as.numeric(scale(.)))) %>%
+  mutate(admissions_weekly_w_1 = lag(admissions_weekly, 1))
 
-write.csv(ww_hosp_weekly_scale, "DataProcessed/ww_hosp_weekly_scale.csv")
-
-ww_hosp_weekly_scale_long <- ww_hosp_weekly_scale %>%
-  select(!contains("_w_"), -c(category, census_population, admissions_weekly)) %>%
-  pivot_longer(c(contains("weekly")), names_to = "norm_method", values_to = "value")
+ww_hosp_model_long <- ww_hosp_model %>%
+  pivot_longer(c(contains("conc")),  names_to = "norm_method", values_to = "value") %>%
+  ungroup() %>%
+  arrange(category_id, sewershed_id) %>%
+  mutate(sewershed_code_factor = factor(sewershed_code, unique(sewershed_code)))
 
 plot_norm_methods <- list()
 for(i in 1:length(titles)){
-  plot_norm_methods[[i]] <- ggplot(data = ww_hosp_weekly_scale_long %>% filter(pcr_target == pcr_targets[i])) +
+  plot_norm_methods[[i]] <- ggplot(data = ww_hosp_model_long %>% filter(pcr_target == pcr_targets[i])) +
     geom_line(aes(x = week_end, y = value, group = norm_method, color = norm_method)) +
-    labs(x = "Week End Date", y = "Z-Scored Value", color = "Normalization Method") +
-    ggtitle(paste("Normalized", titles[i], "Viral Concentrations")) +
+    labs(x = "Week End Date", y = "Value", color = "Normalization Method") +
     scale_x_date(date_labels = "%b %Y") +
     scale_color_manual(labels = c("Combination-Normalized", "Flow-Normalized",
-                                  "Mobile Device-Normalized", "Raw Concentration", "WVAL"),
+                                  "Mobile Device-Normalized", "Raw Concentration",
+                                  "WVAL"),
                        values = c("violet", "turquoise2", "firebrick",
-                                  "darkorchid4", "darkorange")) +
+                                  "darkorchid4", "orange")) +
     guides(color = guide_legend(override.aes = list(linewidth = 8), nrow = 5)) +
     facet_wrap(~utility, scales = "free_y") +
     theme
   ggsave(paste0("Figures/plot_norm_methods_", pcr_targets[i], ".png"), width = 17, height = 9, plot = plot_norm_methods[[i]])
 }
 
+plot_norm_methods_anon <- list()
+for(i in 1:length(titles)){
+  plot_norm_methods_anon[[i]] <- ggplot(data = ww_hosp_model_long %>% filter(pcr_target == pcr_targets[i])) +
+    geom_line(aes(x = week_end, y = value, group = norm_method, color = norm_method)) +
+    labs(x = "Week End Date", y = "Value", color = "Normalization Method") +
+    scale_x_date(date_labels = "%b %Y") +
+    scale_color_manual(labels = c("Combination-Normalized", "Flow-Normalized",
+                                  "Mobile Device-Normalized", "Raw Concentration",
+                                  "WVAL"),
+                       values = c("violet", "turquoise2", "firebrick",
+                                  "darkorchid4", "orange")) +
+    guides(color = guide_legend(override.aes = list(linewidth = 8), nrow = 5)) +
+    facet_wrap(~sewershed_code_factor, scales = "free_y") +
+    theme
+  ggsave(paste0("Figures/plot_norm_methods_anon_", pcr_targets[i], ".png"), width = 17, height = 9, plot = plot_norm_methods_anon[[i]])
+}
+
 plot_hosp_ts <- list()
 for(i in 1:length(titles)){
-  plot_hosp_ts[[i]] <- ggplot(data = ww_hosp_weekly %>% filter(pcr_target == pcr_targets[i])) +
-    geom_bar(aes(x = week_end, y = admissions_weekly), stat = "identity") +
-    labs(x = "Week End Date", y = "Weekly Hospital Admissions") +
-    ggtitle(paste(titles[i], "Hospital Admissions Over Time")) +
+  plot_hosp_ts[[i]] <- ggplot(data = ww_hosp_model %>% filter(pcr_target == pcr_targets[i])) +
+    geom_bar(aes(x = week_end, y = admissions_weekly, fill = size), stat = "identity") +
+    labs(x = "Week End Date", y = "Weekly Total Hospital Admissions", fill = "Size") +
     scale_x_date(date_labels = "%b %Y") +
+    scale_fill_manual(labels = c("Large", "Small"),
+                      values = c("darkblue", "violetred")) +
     facet_wrap(~utility, scales = "free_y") +
     theme
   ggsave(paste0("Figures/plot_hosp_ts_", pcr_targets[i], ".png"), width = 17, height = 9, plot = plot_hosp_ts[[i]])
 }
 
-# do we need zero inflation?
-m_nb <- glmmTMB(admissions_weekly ~ raw_conc_weekly +
-                  offset(log(census_population)) + (1 | utility),
-                family = nbinom2,
-                data = ww_hosp_weekly_scale %>% filter(pcr_target == "sars-cov-2"))
+plot_hosp_ts_anon <- list()
+for(i in 1:length(titles)){
+  plot_hosp_ts_anon[[i]] <- ggplot(data = ww_hosp_model %>% filter(pcr_target == pcr_targets[i])) +
+    geom_bar(aes(x = week_end, y = admissions_weekly), stat = "identity") +
+    labs(x = "Week End Date", y = "Weekly Total Hospital Admissions") +
+    scale_x_date(date_labels = "%b %Y") +
+    facet_wrap(~sewershed_code, scales = "free_y") +
+    theme
+  ggsave(paste0("Figures/plot_hosp_ts_anon_", pcr_targets[i], ".png"), width = 17, height = 9, plot = plot_hosp_ts_anon[[i]])
+}
 
-sim <- simulateResiduals(m_nb)
-plot(sim)
-testZeroInflation(sim) # p = 0.528, no evidence of excess/structural zeros, do not use ZI model
+ww_hosp_model_exclude <- ww_hosp_model %>%
+  group_by(utility, pcr_target) %>%
+  filter(sum(admissions_weekly) > 5)
 
-# check ACF of residuals
-acf(residuals(m_nb)) # some autocorrelation at 1-8 weeks, include lagged admissions as predictor
+# test for multicollinearity
+mc <- ww_hosp_model_exclude %>%
+  group_by(utility, pcr_target) %>%
+  summarize(correlation = cor(raw_conc_weekly, detect_weekly,
+                              use = "complete.obs"),
+            .groups = "drop")
+
+mc_vif <- ww_hosp_model_exclude %>%
+  group_by(utility, pcr_target, .add = TRUE) %>%
+  group_split() %>%
+  map_dfr(function(sub_df) {
+    
+    model <- lm(admissions_weekly ~ raw_conc_weekly + detect_weekly, data = sub_df)
+    
+    vif_vals <- vif(model)
+    
+    tibble(utility = unique(sub_df$utility),
+           pcr_target  = unique(sub_df$pcr_target),
+           vif = vif_vals["raw_conc_weekly"]
+    )
+  })
+
+mc_combined <- left_join(mc, mc_vif)
+
+write.csv(mc_combined, "DataProcessed/mc_combined.csv")
+
+# mc_gt10 <- mc_combined %>%
+#   filter(vif > 10)
+# 
+# ww_hosp_model_exclude_high_vif <- ww_hosp_model_exclude %>%
+#   semi_join(mc_gt10)
+# 
+# # fit models on the most problematic sewersheds with VIF > 10
+# fit_models <- function(df) {
+#   
+#   detect_only <- glmmTMB(admissions_weekly ~ detect_weekly + admissions_weekly_w_1,
+#                          family = nbinom2, data = df)
+#   
+#   conc_only <- glmmTMB(admissions_weekly ~ log_raw_conc_weekly + admissions_weekly_w_1,
+#                        family = nbinom2, data = df)
+#   
+#   both <- glmmTMB(admissions_weekly ~ log_raw_conc_weekly + detect_weekly + admissions_weekly_w_1,
+#                   family = nbinom2, data = df)
+#   
+#   list(detect_only = detect_only,
+#        conc_only = conc_only,
+#        both = both)
+# }
+# 
+# grouped_data <- ww_hosp_model_exclude_high_vif %>%
+#   group_by(utility, pcr_target) %>%
+#   group_nest()
+# 
+# models_df <- ww_hosp_model_exclude_high_vif %>%
+#   group_by(utility, pcr_target) %>%
+#   group_nest() %>%
+#   mutate(models = map(data, fit_models))
+# 
+# aic_long <- models_df %>%
+#   mutate(
+#     aic = map(models, ~ tibble(
+#       model = c("detect_only", "conc_only", "both"),
+#       aic = AIC(.x$detect_only, .x$conc_only, .x$both)
+#     ))
+#   ) %>%
+#   select(utility, pcr_target, aic) %>%
+#   unnest(aic)
+# 
+# lrt_df <- models_df %>%
+#   mutate(
+#     lrt_detect = map(models, ~ anova(.x$detect_only, .x$both, test="LRT")),
+#     lrt_conc   = map(models, ~ anova(.x$conc_only, .x$both, test="LRT"))
+#   ) %>%
+#   select(utility, pcr_target, lrt_detect, lrt_conc)
+# 
+# extract_lrt <- function(x, prefix) {
+#   tibble(
+#     !!paste0(prefix, "_chisq") := x$Chisq[2],
+#     !!paste0(prefix, "_df")    := x$`Chi Df`[2],
+#     !!paste0(prefix, "_p")     := x$`Pr(>Chisq)`[2]
+#   )
+# }
+# 
+# lrt_clean <- lrt_df %>%
+#   mutate(
+#     detect = map(lrt_detect, ~ extract_lrt(.x, "detect")),
+#     conc   = map(lrt_conc, ~ extract_lrt(.x, "conc"))
+#   ) %>%
+#   select(utility, pcr_target, detect, conc) %>%
+#   unnest(c(detect, conc))
+
+## with quadratic term
+fit_models <- function(df) {
+  
+  with_quad <- glmmTMB(admissions_weekly ~ raw_conc_weekly + I(raw_conc_weekly^2) + admissions_weekly_w_1,
+                         family = nbinom2, data = df)
+  
+  without_quad <- glmmTMB(admissions_weekly ~ raw_conc_weekly + admissions_weekly_w_1,
+                            family = nbinom2, data = df)
+  
+  list(with_quad = with_quad,
+       without_quad = without_quad)
+}
+
+grouped_data <- ww_hosp_model_exclude %>%
+  group_by(utility, pcr_target) %>%
+  group_nest()
+
+models_df <- ww_hosp_model_exclude %>%
+  group_by(utility, pcr_target) %>%
+  group_nest() %>%
+  mutate(models = map(data, fit_models))
+
+aic_long <- models_df %>%
+  mutate(
+    aic = map(models, ~ tibble(
+      model = c("with_quad", "without_quad"),
+      aic = AIC(.x$with_quad, .x$without_quad)
+    ))
+  ) %>%
+  select(utility, pcr_target, aic) %>%
+  unnest(aic)
+
+lrt_df <- models_df %>%
+  mutate(
+    with_quad = map(models, ~ anova(.x$with_quad, .x$without_quad, test="LRT")),
+  ) %>%
+  select(utility, pcr_target, with_quad)
+
+extract_lrt <- function(x, prefix) {
+  tibble(
+    #!!paste0(prefix, "_chisq") := x$Chisq[2],
+    #!!paste0(prefix, "_df")    := x$`Chi Df`[2],
+    !!paste0(prefix, "_lrt_p")     := x$`Pr(>Chisq)`[2]
+  )
+}
+
+lrt_clean <- lrt_df %>%
+  mutate(
+    quad = map(with_quad, ~ extract_lrt(.x, "with_quad")),
+  ) %>%
+  select(utility, pcr_target, quad) %>%
+  unnest(c(quad))
+
+write.csv(lrt_clean, "DataProcessed/with_quad_lrt_no_detect.csv")
+
+###
 
 # variables to loop over
 norm_vars <- c("raw_conc_weekly", "flow_norm_conc_weekly", "mobile_norm_conc_weekly",
@@ -319,158 +890,1315 @@ norm_vars <- c("raw_conc_weekly", "flow_norm_conc_weekly", "mobile_norm_conc_wee
 
 norm_names <- c("raw", "flow", "mobile", "combo", "wval")
 
+utilities <- unique(ww_hosp_model$utility)
+  
 # function to build NB model formula for any normalization method
 build_formula <- function(var) {
+  #as.formula(paste("admissions_weekly ~", var, "+ I(", var, "^2)",
   as.formula(paste("admissions_weekly ~", var,
-                   "+ admissions_weekly_w_1 + offset(log(census_population)) + (1 | utility)"))
+                   "+ detect_weekly + admissions_weekly_w_1"))
 }
 
-# function to fit NB model to any PCR target (all categories)
-fit_nb_model_all <- function(var, target) {
+# function to fit NB model for any pathogen and sewershed
+fit_nb_model <- function(var, target, sewershed) {
   glmmTMB(formula = build_formula(var),
           family = nbinom2,
-          data = dplyr::filter(ww_hosp_weekly_scale, pcr_target == target))
+          data = ww_hosp_model_exclude %>% filter(utility == sewershed, pcr_target == target),
+          control = glmmTMBControl(optimizer = optim, optArgs = list(method = "BFGS")))
 }
 
-# function to fit NB model to any PCR target (each category)
-fit_nb_model_cat <- function(var, target, ww_cat) {
-  glmmTMB(formula = build_formula(var),
-          family = nbinom2,
-          data = dplyr::filter(ww_hosp_weekly_scale, pcr_target == target, category == ww_cat))
-}
+# create a grid to organize pathogen x sewershed combos
+model_grid <- expand_grid(sewershed = utilities,
+                          target = pcr_targets,
+                          var = norm_vars)
 
-# run models for each pathogen and category
-models_primary_covid_all <- lapply(norm_vars, fit_nb_model_all, target = "sars-cov-2")
-models_primary_covid_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "High Tourism")
-models_primary_covid_metro <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Metro")
-models_primary_covid_other <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Other")
+results <- model_grid %>%
+  mutate(model = pmap(list(var, target, sewershed), fit_nb_model))
 
-models_primary_flu_all <- lapply(norm_vars, fit_nb_model_all, target = "fluav")
-models_primary_flu_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "fluav", ww_cat = "High Tourism")
-models_primary_flu_metro <- lapply(norm_vars, fit_nb_model_cat, target = "fluav", ww_cat = "Metro")
-models_primary_flu_other <- lapply(norm_vars, fit_nb_model_cat, target = "fluav", ww_cat = "Other")
-
-models_primary_rsv_all <- lapply(norm_vars, fit_nb_model_all, target = "rsv")
-models_primary_rsv_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "rsv", ww_cat = "High Tourism")
-models_primary_rsv_metro <- lapply(norm_vars, fit_nb_model_cat, target = "rsv", ww_cat = "Metro")
-models_primary_rsv_other <- lapply(norm_vars, fit_nb_model_cat, target = "rsv", ww_cat = "Other")
-
-# function to generate model performance metrics
-compare_models_all <- function(model_list) {
-  data.frame(normalization = norm_names,
-             AIC = sapply(model_list, AIC),
-             beta = sapply(model_list, \(m) summary(m)$coefficients$cond[2,1]),
-             p_value = sapply(model_list, \(m) summary(m)$coefficients$cond[2,4]))
-}
-
-# compare models
-model_comparisons <- mget(ls(pattern = "^models_primary_")) %>%
-  map(~ compare_models_all(.x) %>% arrange(AIC))
-
-all_models_tbl_primary <- imap_dfr(model_comparisons, ~ {
-  .x %>% 
-    mutate(
-      model_set = .y)
-})
-
-all_models_tbl_primary <- all_models_tbl_primary %>%
-  separate(model_set, into = c("model", "analysis", "pathogen", "category"), sep = "_", remove = FALSE) %>%
-  select(analysis, pathogen, category, normalization, AIC, beta, p_value) %>%
-  mutate(irr = round(exp(beta), 2),
-         p_value = round(p_value, 3),
-         significant = ifelse(p_value < 0.05, "yes", "no"))
-
-write.csv(all_models_tbl_primary, "DataProcessed/model_comparisons_all_primary.csv", row.names = FALSE)
-
-all_models_irr_primary <- all_models_tbl_primary %>%
-  arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
-  select(pathogen, category, normalization, irr) %>%
-  pivot_wider(names_from = normalization, values_from = irr)
-
-write.csv(all_models_irr_primary, "DataProcessed/all_models_irr_primary.csv")
-
-all_models_aic_primary <- all_models_tbl_primary %>%
-  group_by(pathogen, category) %>%
-  mutate(rank = ifelse(is.na(AIC), NA, row_number()),
-         delta_AIC_next = AIC - lag(AIC),
+results_table <- results %>%
+  mutate(AIC = map_dbl(model, AIC),
+         logLik = map_dbl(model, ~as.numeric(logLik(.x))),
+         var = as.factor(recode(var, "raw_conc_weekly" = "Raw",
+                      "flow_norm_conc_weekly" = "Flow",
+                      "mobile_norm_conc_weekly" = "Mobile",
+                      "combo_norm_conc_weekly" = "Combo",
+                      "WVAL_conc_weekly" = "WVAL"))) %>%
+  group_by(sewershed, target) %>%
+  arrange(AIC) %>%
+  mutate(#delta_AIC_next = AIC - lag(AIC),
          delta_AIC_cumul = AIC - min(AIC),
-         AIC_weight = round(exp(-0.5*delta_AIC_cumul) / sum(exp(-0.5*delta_AIC_cumul)), 3)) %>%
-  select(pathogen, category, normalization, contains("AIC"), rank)
+         delta_AIC_overall = format(round(max(AIC) - min(AIC), 2), nsmall = 2),
+         delta_AIC_overall = case_when(delta_AIC_overall == "NA" ~ "",
+                                       TRUE ~ delta_AIC_overall),
+         rank = case_when(is.na(AIC) ~ NA_character_,
+                          TRUE ~ as.factor(row_number())),
+         distance = as.factor(case_when(delta_AIC_cumul < 2 ~ "<2",
+                          delta_AIC_cumul >= 2 & delta_AIC_cumul < 4 ~ ">=2 and <4",
+                          delta_AIC_cumul >= 4 & delta_AIC_cumul < 6 ~ ">=4 and <6",
+                          delta_AIC_cumul >= 6 & delta_AIC_cumul < 8 ~ ">=6 and <8",
+                          delta_AIC_cumul >= 8 ~ ">=8",
+                          TRUE ~ NA_character_)),
+         font_color = case_when(distance %in% c("<2", ">=2 and <4", ">=4 and <6") ~ "white",
+                                distance %in% c(">=6 and <8", ">=8") ~ "black")) %>%
+  rename(utility = sewershed) %>%
+  select(-model) %>%
+  left_join(sentinel) %>%
+  arrange(category_id, sewershed_id)
 
-write.csv(all_models_aic_primary, "DataProcessed/all_models_aic_primary.csv")
+heatmap_rank <- list()
+for(i in 1:length(pcr_targets)){
+  heatmap_rank[[i]] <- ggplot(data = results_table %>% filter(target == pcr_targets[i])) +
+    geom_tile(aes(x = factor(var, levels = c("Raw", "Flow", "Mobile", "Combo", "WVAL")), y = factor(utility, levels = rev(unique(utility))),
+                  fill = factor(distance, levels = c("<2", ">=2 and <4", ">=4 and <6", ">=6 and <8", ">=8"))), color = "white", linewidth = 0.1) +
+    geom_text(data = results_table %>% filter(target == pcr_targets[i]),
+              aes(x = var,
+                  y = utility,
+                  label = rank,
+                  color = font_color)) +
+    geom_text(data = results_table %>% filter(target == pcr_targets[i]) %>% distinct(utility, delta_AIC_overall),
+              aes(x = 5.5, y = utility,
+                  label = delta_AIC_overall, nudge_x = 0.35)) +
+    labs(x = NULL, y = NULL, fill = "Difference in AIC from Leading Model") +
+    scale_x_discrete(expand = expansion(mult = c(0, 0.3))) +
+    #scale_fill_identity("Assay") +
+    scale_color_manual(values = c("<2" = "white",
+                                  ">=2 and <4" = "white",
+                                  ">=4 and <6" = "white",
+                                  ">=6 and <8" = "black",
+                                  ">=8" = "black")) +
+    scale_fill_manual(values = c("<2" = "midnightblue",
+                                 ">=2 and <4" = "dodgerblue4",
+                                 ">=4 and <6" = "steelblue3",
+                                 ">=6 and <8" = "skyblue2",
+                                 ">=8" = "lightblue1"),
+                      breaks = c("<2", ">=2 and <4", ">=4 and <6", ">=6 and <8", ">=8"),
+                      na.value = "grey30") +
+    guides(color = "none", fill = guide_legend(title.position = "top", title.hjust = 0.5)) +
+    theme +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+          legend.position = "bottom",
+          legend.key.spacing.x = unit(1, "cm"))
+  ggsave(paste0("Figures/heatmap_rank_", pcr_targets[i], ".png"), width = 8, height = 5, plot = heatmap_rank[[i]])
+}
 
-all_models_rank_primary <- all_models_aic_primary %>%
-  arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
-  select(pathogen, category, normalization, rank) %>%
-  pivot_wider(names_from = normalization, values_from = rank)
+heatmap_rank_anon <- list()
+for(i in 1:length(pcr_targets)){
+  heatmap_rank_anon[[i]] <- ggplot(data = results_table %>% filter(target == pcr_targets[i])) +
+    geom_tile(aes(x = factor(var, levels = c("Raw", "Flow", "Mobile", "Combo", "WVAL")), y = factor(sewershed_code, levels = rev(unique(sewershed_code))),
+                  fill = factor(distance, levels = c("<2", ">=2 and <4", ">=4 and <6", ">=6 and <8", ">=8"))), color = "white", linewidth = 0.1) +
+    geom_text(data = results_table %>% filter(target == pcr_targets[i]),
+              aes(x = var,
+                  y = sewershed_code,
+                  label = rank,
+                  color = font_color)) +
+    geom_text(data = results_table %>% filter(target == pcr_targets[i]) %>% distinct(sewershed_code, delta_AIC_overall),
+              aes(x = 5.5, y = sewershed_code,
+                  label = delta_AIC_overall, nudge_x = 0.35)) +
+    labs(x = NULL, y = NULL, fill = "Difference in AIC from Leading Model") +
+    scale_x_discrete(expand = expansion(mult = c(0, 0.3))) +
+    #scale_fill_identity("Assay") +
+    scale_color_manual(values = c("<2" = "white",
+                                  ">=2 and <4" = "white",
+                                  ">=4 and <6" = "white",
+                                  ">=6 and <8" = "black",
+                                  ">=8" = "black")) +
+    scale_fill_manual(values = c("<2" = "midnightblue",
+                                 ">=2 and <4" = "dodgerblue4",
+                                 ">=4 and <6" = "steelblue3",
+                                 ">=6 and <8" = "skyblue2",
+                                 ">=8" = "lightblue1"),
+                      breaks = c("<2", ">=2 and <4", ">=4 and <6", ">=6 and <8", ">=8"),
+                      na.value = "grey30") +
+    guides(color = "none", fill = guide_legend(title.position = "top", title.hjust = 0.5)) +
+    theme +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+          legend.position = "bottom",
+          legend.key.spacing.x = unit(1, "cm"))
+  ggsave(paste0("Figures/heatmap_rank_anon_", pcr_targets[i], ".png"), width = 8, height = 5, plot = heatmap_rank_anon[[i]])
+}
 
-write.csv(all_models_rank_primary, "DataProcessed/all_models_rank_primary.csv")
+# summary tables
+summary_table_pathogen <- results_table %>%
+  group_by(target, category, var) %>%
+  #mutate(effective_rank = as.numeric(effective_rank)) %>%
+  #summarize(mean_effective_rank = round(mean(effective_rank, na.rm = TRUE), 2)) %>%
+  summarize(mean_delta_AIC_cumul = round(mean(delta_AIC_cumul, na.rm = TRUE), 2)) %>%
+  pivot_wider(names_from = var, values_from = mean_delta_AIC_cumul) %>%
+  select(target, category, Raw, Flow, Mobile, Combo, WVAL)
 
-# SENSITIVITY ANALYSIS
-# variables to loop over
-norm_vars_sens <- c("raw_conc_weekly_w_1", "flow_norm_conc_weekly_w_1", "mobile_norm_conc_weekly_w_1",
-               "combo_norm_conc_weekly_w_1", "WVAL_conc_weekly_w_1")
+summary_table_pathogen_overall <- summary_table_pathogen %>%
+  group_by(target) %>%
+  summarize(across(c(Raw, Flow, Mobile, Combo, WVAL), ~ round(mean(.x, na.rm = TRUE), 2))) %>%
+  mutate(target = recode(target, "fluav" = "fluav_overall",
+                           "rsv" = "rsv_overall",
+                           "sars-cov-2" = "sars-cov-2_overall")) %>%
+  bind_rows(summary_table_pathogen) %>%
+  arrange(target, category) %>%
+  select(target, category, Raw, Flow, Mobile, Combo, WVAL)
 
-norm_names_sens <- c("raw_w_1", "flow_w_1", "mobile_w_1", "combo_w_1", "wval_w_1")
+write.csv(summary_table_pathogen_overall, "DataProcessed/summary_table_pathogen_overall.csv")
 
-# run models for each pathogen and category (sensitivity analysis)
-models_sensitivity_covid_all <- lapply(norm_vars_sens, fit_nb_model_all, target = "sars-cov-2")
-models_sensitivity_covid_hightourism <- lapply(norm_vars_sens, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "High Tourism")
-models_sensitivity_covid_metro <- lapply(norm_vars_sens, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Metro")
-models_sensitivity_covid_other <- lapply(norm_vars_sens, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Other")
+summary_table_category <- results_table %>%
+  group_by(category, target, var) %>%
+  # mutate(effective_rank = as.numeric(effective_rank)) %>%
+  # summarize(mean_effective_rank = round(mean(effective_rank, na.rm = TRUE), 2)) %>%
+  summarize(mean_delta_AIC_cumul = round(mean(delta_AIC_cumul, na.rm = TRUE), 2)) %>%
+  pivot_wider(names_from = var, values_from = mean_delta_AIC_cumul) %>%
+  select(category, target, Raw, Flow, Mobile, Combo, WVAL)
 
-models_sensitivity_flu_all <- lapply(norm_vars_sens, fit_nb_model_all, target = "fluav")
-models_sensitivity_flu_hightourism <- lapply(norm_vars_sens, fit_nb_model_cat, target = "fluav", ww_cat = "High Tourism")
-models_sensitivity_flu_metro <- lapply(norm_vars_sens, fit_nb_model_cat, target = "fluav", ww_cat = "Metro")
-models_sensitivity_flu_other <- lapply(norm_vars_sens, fit_nb_model_cat, target = "fluav", ww_cat = "Other")
+summary_table_category_overall <- summary_table_category %>%
+  group_by(category) %>%
+  summarize(across(c(Raw, Flow, Mobile, Combo, WVAL), ~ round(mean(.x, na.rm = TRUE), 2))) %>%
+  mutate(category = recode(category, "High Tourism" = "High Tourism Overall",
+                         "Metro" = "Metro Overall",
+                         "Other Large" = "Other Large Overall",
+                         "Other Small" = "Other Small OVerall")) %>%
+  bind_rows(summary_table_category) %>%
+  arrange(category, target) %>%
+  select(category, target, Raw, Flow, Mobile, Combo, WVAL)
 
-models_sensitivity_rsv_all <- lapply(norm_vars_sens, fit_nb_model_all, target = "rsv")
-models_sensitivity_rsv_hightourism <- lapply(norm_vars_sens, fit_nb_model_cat, target = "rsv", ww_cat = "High Tourism")
-models_sensitivity_rsv_metro <- lapply(norm_vars_sens, fit_nb_model_cat, target = "rsv", ww_cat = "Metro")
-models_sensitivity_rsv_other <- lapply(norm_vars_sens, fit_nb_model_cat, target = "rsv", ww_cat = "Other")
+write.csv(summary_table_category_overall, "DataProcessed/summary_table_category_overall.csv")
+  
+#################################### GARBAGE BELOW ###############################################
 
-# compare models
-model_comparisons_sens <- mget(ls(pattern = "^models_sensitivity_")) %>%
-  map(~ compare_models_all(.x) %>% arrange(AIC))
 
-all_models_tbl_sensitivity <- imap_dfr(model_comparisons_sens, ~ {
-  .x %>% 
-    mutate(
-      model_set = .y)
-})
-
-all_models_tbl_sensitivity <- all_models_tbl_sensitivity %>%
-  separate(model_set, into = c("model", "analysis", "pathogen", "category"), sep = "_", remove = FALSE) %>%
-  select(analysis, pathogen, category, normalization, AIC, beta, p_value) %>%
-  mutate(irr = round(exp(beta), 2),
-         p_value = round(p_value, 3),
-         significant = ifelse(p_value < 0.05, "yes", "no"))
-
-write.csv(all_models_tbl_sensitivity, "DataProcessed/model_comparisons_all_sensitivity.csv", row.names = FALSE)
-
-all_models_irr_sensitivity <- all_models_tbl_sensitivity %>%
-  arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
-  select(pathogen, category, normalization, irr) %>%
-  pivot_wider(names_from = normalization, values_from = irr)
-
-write.csv(all_models_irr_sensitivity, "DataProcessed/all_models_irr_sensitivity.csv")
-
-all_models_aic_sensitivity <- all_models_tbl_sensitivity %>%
-  group_by(pathogen, category) %>%
-  mutate(rank = ifelse(is.na(AIC), NA, row_number()),
-         delta_AIC_next = AIC - lag(AIC),
-         delta_AIC_cumul = AIC - min(AIC),
-         AIC_weight = round(exp(-0.5*delta_AIC_cumul) / sum(exp(-0.5*delta_AIC_cumul)), 3)) %>%
-  select(pathogen, category, normalization, contains("AIC"), rank)
-
-write.csv(all_models_aic_sensitivity, "DataProcessed/all_models_aic_sensitivity.csv")
-
-all_models_rank_sensitivity <- all_models_aic_sensitivity %>%
-  arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
-  select(pathogen, category, normalization, rank) %>%
-  pivot_wider(names_from = normalization, values_from = rank)
-
-write.csv(all_models_rank_sensitivity, "DataProcessed/all_models_rank_sensitivity.csv")
-
-##########################################################################################
-
+# # run models for each pathogen and sewershed
+# models_covid_aspen_hightourism <- lapply(norm_vars, fit_nb_model, target = "sars-cov-2", sewershed = "Aspen")
+# models_covid_alamosa_other <- lapply(norm_vars, fit_nb_model, target = "sars-cov-2", sewershed = "Alamosa")
+# models_covid_boulder_other <- lapply(norm_vars, fit_nb_model, target = "sars-cov-2", sewershed = "Boulder")
+# 
+# models_flu_aspen_hightourism <- lapply(norm_vars, fit_nb_model, target = "fluav", sewershed = "Aspen")
+# models_flu_alamosa_other <- lapply(norm_vars, fit_nb_model, target = "fluav", sewershed = "Alamosa")
+# models_flu_boulder_other <- lapply(norm_vars, fit_nb_model, target = "fluav", sewershed = "Boulder")
+# 
+# 
+# # function to generate model performance metrics
+# compare_models_all <- function(model_list) {
+#   data.frame(normalization = norm_names,
+#              AIC = sapply(model_list, AIC))
+#              #beta = sapply(model_list, \(m) summary(m)$coefficients$cond[2,1]),
+#              #p_value = sapply(model_list, \(m) summary(m)$coefficients$cond[2,4]))
+# }
+# 
+# # compare models
+# model_comparisons <- mget(ls(pattern = "^models_")) %>%
+#   map(~ compare_models_all(.x) %>% arrange(AIC))
+# 
+# all_models_tbl_primary <- imap_dfr(model_comparisons, ~ {
+#   .x %>% 
+#     mutate(
+#       model_set = .y)
+# })
+# 
+# all_models_tbl_primary <- all_models_tbl_primary %>%
+#   separate(model_set, into = c("model", "pathogen", "sewershed", "category"), sep = "_", remove = FALSE) %>%
+#   select(pathogen, sewershed, category, normalization, AIC) #%>%
+#   # mutate(irr = round(exp(beta), 2),
+#   #        p_value = round(p_value, 3),
+#   #        significant = ifelse(p_value < 0.05, "yes", "no"))
+# 
+# write.csv(all_models_tbl_primary, "DataProcessed/model_comparisons_all_primary_20260323.csv", row.names = FALSE)
+# 
+# 
+# 
+# 
+# ############################################################################
+# 
+# 
+# 
+# 
+# # function to fit NB model to any PCR target (all categories)
+# fit_nb_model_all <- function(var, target) {
+#   glmmTMB(formula = build_formula(var),
+#           family = nbinom2,
+#           data = dplyr::filter(ww_hosp_scale, pcr_target == target),
+#           control = glmmTMBControl(optimizer = optim, optArgs = list(method = "BFGS")))
+# }
+# 
+# # function to fit NB model to any PCR target (each category)
+# fit_nb_model_cat <- function(var, target, ww_cat) {
+#   glmmTMB(formula = build_formula(var),
+#           family = nbinom2,
+#           data = dplyr::filter(ww_hosp_scale, pcr_target == target, category == ww_cat),
+#           control = glmmTMBControl(optimizer = optim, optArgs = list(method = "BFGS")))
+# }
+# 
+# # run models for each pathogen and category
+# models_covid_all <- lapply(norm_vars, fit_nb_model_all, target = "sars-cov-2")
+# models_covid_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "High Tourism")
+# models_covid_metro <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Metro")
+# models_covid_other <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Other")
+# 
+# models_flu_all <- lapply(norm_vars, fit_nb_model_all, target = "fluav")
+# models_flu_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "fluav", ww_cat = "High Tourism")
+# models_flu_metro <- lapply(norm_vars, fit_nb_model_cat, target = "fluav", ww_cat = "Metro")
+# models_flu_other <- lapply(norm_vars, fit_nb_model_cat, target = "fluav", ww_cat = "Other")
+# 
+# models_rsv_all <- lapply(norm_vars, fit_nb_model_all, target = "rsv")
+# models_rsv_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "rsv", ww_cat = "High Tourism")
+# models_rsv_metro <- lapply(norm_vars, fit_nb_model_cat, target = "rsv", ww_cat = "Metro")
+# models_rsv_other <- lapply(norm_vars, fit_nb_model_cat, target = "rsv", ww_cat = "Other")
+# 
+# # function to generate model performance metrics
+# compare_models_all <- function(model_list) {
+#   data.frame(normalization = norm_names,
+#              AIC = sapply(model_list, AIC),
+#              beta = sapply(model_list, \(m) summary(m)$coefficients$cond[2,1]),
+#              p_value = sapply(model_list, \(m) summary(m)$coefficients$cond[2,4]))
+# }
+# 
+# # compare models
+# model_comparisons <- mget(ls(pattern = "^models_")) %>%
+#   map(~ compare_models_all(.x) %>% arrange(AIC))
+# 
+# all_models_tbl_primary <- imap_dfr(model_comparisons, ~ {
+#   .x %>% 
+#     mutate(
+#       model_set = .y)
+# })
+# 
+# all_models_tbl_primary <- all_models_tbl_primary %>%
+#   separate(model_set, into = c("model", "pathogen", "category"), sep = "_", remove = FALSE) %>%
+#   select(pathogen, category, normalization, AIC, beta, p_value) %>%
+#   mutate(irr = round(exp(beta), 2),
+#          p_value = round(p_value, 3),
+#          significant = ifelse(p_value < 0.05, "yes", "no"))
+# 
+# a <- all_models_tbl_primary %>%
+#   filter(category == "all")
+# 
+# b <- all_models_tbl_primary %>%
+#   filter(category != "all")
+# 
+# write.csv(all_models_tbl_primary, "DataProcessed/model_comparisons_all_primary_20260323.csv", row.names = FALSE)
+# 
+# all_models_irr_primary <- all_models_tbl_primary %>%
+#   arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
+#   select(pathogen, category, normalization, irr) %>%
+#   pivot_wider(names_from = normalization, values_from = irr)
+# 
+# write.csv(all_models_irr_primary, "DataProcessed/all_models_irr_primary_20260323.csv")
+# 
+# all_models_aic_primary <- all_models_tbl_primary %>%
+#   group_by(pathogen, category) %>%
+#   mutate(rank = ifelse(is.na(AIC), NA, row_number()),
+#          delta_AIC_next = AIC - lag(AIC),
+#          delta_AIC_cumul = AIC - min(AIC),
+#          AIC_weight = round(exp(-0.5*delta_AIC_cumul) / sum(exp(-0.5*delta_AIC_cumul)), 3)) %>%
+#   select(pathogen, category, normalization, contains("AIC"), rank)
+# 
+# write.csv(all_models_aic_primary, "DataProcessed/all_models_aic_primary_20260323.csv")
+# 
+# all_models_rank_primary <- all_models_aic_primary %>%
+#   arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
+#   select(pathogen, category, normalization, rank) %>%
+#   pivot_wider(names_from = normalization, values_from = rank)
+# 
+# write.csv(all_models_rank_primary, "DataProcessed/all_models_rank_primary_20260323.csv")
+# 
+# 
+# 
+# 
+# 
+# 
+# ###############################################
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# plot_norm_methods <- list()
+# for(i in 1:length(titles)){
+#   plot_norm_methods[[i]] <- ggplot(data = ww_hosp_scale_long %>% filter(pcr_target == pcr_targets[i])) +
+#     geom_line(aes(x = week_end, y = value, group = norm_method, color = norm_method)) +
+#     labs(x = "Week End Date", y = "Z-Scored Value", color = "Normalization Method") +
+#     ggtitle(paste("Normalized", titles[i], "Viral Concentrations")) +
+#     scale_x_date(date_labels = "%b %Y") +
+#     scale_color_manual(labels = c("Combination-Normalized", "Flow-Normalized",
+#                                   "Mobile Device-Normalized", "Raw Concentration", "WVAL"),
+#                        values = c("violet", "turquoise2", "firebrick",
+#                                   "darkorchid4" , "darkorange")) +
+#     guides(color = guide_legend(override.aes = list(linewidth = 8), nrow = 5)) +
+#     facet_wrap(~utility, scales = "free_y") +
+#     theme
+#   ggsave(paste0("Figures/plot_norm_methods_", pcr_targets[i], ".png"), width = 17, height = 9, plot = plot_norm_methods[[i]])
+# }
+# 
+# plot_norm_methods_anon <- list()
+# for(i in 1:length(titles)){
+#   plot_norm_methods_anon[[i]] <- ggplot(data = ww_hosp_scale_long %>% filter(pcr_target == pcr_targets[i])) +
+#     geom_line(aes(x = week_end, y = value, group = norm_method, color = norm_method)) +
+#     labs(x = "Week End Date", y = "Z-Scored Value", color = "Normalization Method") +
+#     ggtitle(paste("Normalized", titles[i], "Viral Concentrations")) +
+#     scale_x_date(date_labels = "%b %Y") +
+#     scale_color_manual(labels = c("Combination-Normalized", "Flow-Normalized",
+#                                   "Mobile Device-Normalized", "Raw Concentration", "WVAL"),
+#                        values = c("violet", "turquoise2", "firebrick",
+#                                   "darkorchid4" , "darkorange")) +
+#     guides(color = guide_legend(override.aes = list(linewidth = 8), nrow = 5)) +
+#     facet_wrap(~sewershed_code_factor, scales = "free_y") +
+#     theme
+#   ggsave(paste0("Figures/plot_norm_methods_anon_", pcr_targets[i], ".png"), width = 17, height = 9, plot = plot_norm_methods_anon[[i]])
+# }
+# 
+# plot_hosp_ts <- list()
+# for(i in 1:length(titles)){
+#   plot_hosp_ts[[i]] <- ggplot(data = ww_hosp_model %>% filter(pcr_target == pcr_targets[i])) +
+#     geom_bar(aes(x = week_end, y = admissions_weekly), stat = "identity") +
+#     labs(x = "Week End Date", y = "Weekly Total Hospital Admissions") +
+#     ggtitle(paste(titles[i], "Hospital Admissions Over Time")) +
+#     scale_x_date(date_labels = "%b %Y") +
+#     facet_wrap(~utility, scales = "free_y") +
+#     theme
+#   ggsave(paste0("Figures/plot_hosp_ts_", pcr_targets[i], ".png"), width = 17, height = 9, plot = plot_hosp_ts[[i]])
+# }
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+#   
+# # hosp_daily <- hosp %>%
+# #   group_by(utility, pcr_target) %>%
+# #   complete(date = seq(min(date), max(date), by = "day"))
+# 
+# ww_hosp_daily <- merge(ww_daily, hosp_daily, c("pcr_target", "utility", "date"), all = TRUE) %>%
+#   select(-lab_phase, -sample_type) %>%
+#   filter(utility %in% sentinel$utility) %>%
+#   left_join(visit) %>%
+#   mutate(mobile_end_date = max(visit$date)) %>%
+#   filter(date <= mobile_end_date) %>%
+#   group_by(utility, pcr_target) %>%
+#   fill(lod_sewage, category, census_population)
+# 
+# ww_hosp_daily_fill <- ww_hosp_daily %>%
+#   group_by(utility, pcr_target) %>%
+#   mutate(pcr_target_avg_conc = na.approx(pcr_target_avg_conc, na.rm = FALSE),
+#          WVAL_conc = na.approx(WVAL_conc, na.rm = FALSE),
+#          flow_rate = na.approx(flow_rate, na.rm = FALSE),
+#          admissions = replace_na(admissions, 0)) %>%
+#   fill(pcr_target_avg_conc, .direction = "downup") %>%
+#   fill(WVAL_conc, .direction = "downup") %>%
+#   fill(flow_rate, .direction = "downup") %>%
+#   mutate(detect = ifelse(pcr_target_avg_conc <= lod_sewage, 0, 1)) %>%
+#   select(-pcr_target_below_lod)
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# fit_zinb <- glmmTMB(admissions ~ detect * log_raw_conc_w_1 + offset(log(census_population)) + (1 | utility),
+#                     family = nbinom2(),
+#                     data = ww_hosp_scale %>% filter(pcr_target == "sars-cov-2"))
+# 
+# summary(fit_zinb)
+# 
+# formula <- bf(admissions ~ detect + detect:log_raw_conc_w_1 + offset(log(census_population)) + (1 | utility),
+#               hu ~ detect + (1 | utility))
+# 
+# fit <- brm(formula = formula,
+#   data = ww_hosp_scale,
+#   family = hurdle_negbinomial(),
+#   chains = 2,
+#   cores = 2,
+#   iter = 2000,
+#   warmup = 1000,
+#   threads = threading(2),
+#   control = list(adapt_delta = 0.99,
+#                  max_treedepth = 12),
+#   seed = 123)
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# # formula builder
+# build_formula <- function(var) {
+#   as.formula(paste("admissions ~", var,
+#                    "+ detect + offset(log(census_population)) + (1 | utility)"))
+# }
+# 
+# fit_raw <- brm(
+#   formula = formula_simple,   # or formula_simple
+#   data = ww_hosp_scale,
+#   family = hurdle_negbinomial(),
+#   chains = 4,
+#   cores = 4,
+#   iter = 4000,
+#   warmup = 2000,
+#   control = list(
+#     adapt_delta = 0.99,
+#     max_treedepth = 12
+#   ),
+#   seed = 123
+# )
+# 
+# 
+# 
+# 
+# 
+# 
+# 
+# fit <- brm(bf(admissions ~ detect + log_raw_conc_w_1 + offset(log(census_population)) + (1 | utility)),
+#   data = ww_hosp_scale %>% filter(pcr_target == "sars-cov-2"),
+#   family = negbinomial(),
+#   prior = c(prior(normal(0, 0.5), class = "b"),
+#             prior(normal(0, 1), class = "Intercept"),
+#             prior(exponential(1), class = "shape")),
+#   iter = 4000,
+#   warmup = 2000,
+#   chains = 4,
+#   cores = 4,
+#   control = list(adapt_delta = 0.995, max_treedepth = 15))
+# 
+# 
+# 
+# fit1 <- brm(bf(admissions ~ detect + flow_norm_conc_w_1 + offset(log(census_population)) + (1 | utility)),
+#             data = ww_hosp_scale %>% filter(pcr_target == "sars-cov-2"),
+#             family = negbinomial(),
+#             chains = 4, cores = 4, iter = 4000,
+#             control = list(adapt_delta = 0.95)
+# )
+# 
+# fit2 <- brm(bf(admissions ~ detect + mobile_norm_conc_w_1 + offset(log(census_population)) + (1 | utility)),
+#             data = ww_hosp_scale %>% filter(pcr_target == "sars-cov-2"),
+#             family = negbinomial(),
+#             chains = 4, cores = 4, iter = 4000,
+#             control = list(adapt_delta = 0.95)
+# )
+# 
+# fit3 <- brm(bf(admissions ~ detect + raw_conc_w_1 + offset(log(census_population)) + (1 | utility)),
+#            data = ww_hosp_scale %>% filter(pcr_target == "fluav"),
+#            family = negbinomial(),
+#            chains = 4, cores = 4, iter = 4000,
+#            control = list(adapt_delta = 0.95)
+# )
+# 
+# fit4 <- brm(bf(admissions ~ detect + flow_norm_conc_w_1 + offset(log(census_population)) + (1 | utility)),
+#             data = ww_hosp_scale %>% filter(pcr_target == "fluav"),
+#             family = negbinomial(),
+#             chains = 4, cores = 4, iter = 4000,
+#             control = list(adapt_delta = 0.95)
+# )
+# 
+# fit5 <- brm(bf(admissions ~ detect + mobile_norm_conc_w_1 + offset(log(census_population)) + (1 | utility)),
+#             data = ww_hosp_scale %>% filter(pcr_target == "fluav"),
+#             family = negbinomial(),
+#             chains = 4, cores = 4, iter = 4000,
+#             control = list(adapt_delta = 0.95)
+# )
+# 
+# 
+# # organize normalization variables
+# norm_vars <- c("raw_conc_w_1", "flow_norm_conc_w_1", "mobile_norm_conc_w_1", "combo_norm_conc_w_1")
+# 
+# targets <- c("sars-cov-2", "fluav", "rsv")
+# 
+# # formula builder
+# build_formula <- function(var) {
+#   as.formula(paste("admissions ~", var,
+#                    "+ detect + offset(log(census_population)) + (1 | utility)"))
+# }
+# 
+# # model fitter
+# fit_bayes_model_all <- function(var, target) {
+#   brm(formula = build_formula(var),
+#       data = filter(ww_hosp_scale, pcr_target == target),
+#       family = negbinomial(),
+#       chains = 4,
+#       cores = 4,
+#       iter = 4000,
+#       warmup = 1000,
+#       backend = "cmdstanr",
+#       control = list(adapt_delta = 0.95),
+#       seed = 686)
+# }
+# 
+# models_covid_all <- lapply(norm_vars, fit_bayes_model_all, target = "sars-cov-2")
+# 
+# 
+# ww_hosp_norm <- ww_hosp %>%
+#   mutate(detect = if_else(pcr_target_below_lod == "yes", 0, 1),
+#          is_below = pcr_target_below_lod == "yes",
+#          # base LODs
+#          lod_flow = lod_sewage * flow_rate,
+#          lod_mobile = lod_sewage / total_devices_daily,
+#          lod_combo = lod_sewage * (flow_rate / total_devices_daily),
+#          # base concentrations
+#          raw_conc = pcr_target_avg_conc,
+#          flow_conc = pcr_target_avg_conc * flow_rate,
+#          mobile_conc = pcr_target_avg_conc / total_devices_daily,
+#          combo_conc = pcr_target_avg_conc * (flow_rate / total_devices_daily)) %>%
+#   # generate all substitution variants
+#   {
+#     factors <- c(sub1 = 1, sub2 = 1/2, sub3 = 1/sqrt(2))
+#     
+#     reduce(names(factors), function(df, nm) {
+#       f <- factors[[nm]]
+#       
+#       df %>%
+#         mutate(!!paste0("raw_conc_", nm) := sub_fun(raw_conc, lod_sewage, is_below, f),
+#                !!paste0("flow_norm_conc_", nm) := sub_fun(flow_conc, lod_flow, is_below, f),
+#                !!paste0("mobile_norm_conc_", nm) := sub_fun(mobile_conc, lod_mobile, is_below, f),
+#                !!paste0("combo_norm_conc_", nm) := sub_fun(combo_conc, lod_combo, is_below, f))
+#     }, .init = .)
+#   } %>%
+# 
+# 
+# 
+# 
+# 
+# # organize normalization variables
+# norm_vars <- list(sub1 = c("raw_conc_sub1_w_1", "flow_norm_conc_sub1_w_1", "mobile_norm_conc_sub1_w_1", "combo_norm_conc_sub1_w_1"),
+#                   sub2 = c("raw_conc_sub2_w_1", "flow_norm_conc_sub2_w_1", "mobile_norm_conc_sub2_w_1", "combo_norm_conc_sub2_w_1"),
+#                   sub3 = c("raw_conc_sub3_w_1", "flow_norm_conc_sub3_w_1", "mobile_norm_conc_sub3_w_1", "combo_norm_conc_sub3_w_1"))
+# 
+# targets <- c("sars-cov-2", "fluav", "rsv")
+# 
+# # formula builder
+# build_formula <- function(var) {
+#   as.formula(paste("admissions ~", var,
+#                    "+ detect + offset(log(census_population)) + (1 | utility)"))
+# }
+# 
+# # model fitter
+# fit_bayes_model_all <- function(var, target) {
+#   brm(formula = build_formula(var),
+#       data = filter(ww_hosp_scale, pcr_target == target),
+#       family = negbinomial(),
+#       chains = 4,
+#       cores = 4,
+#       iter = 4000,
+#       warmup = 1000,
+#       backend = "cmdstanr",
+#       control = list(adapt_delta = 0.9),
+#       seed = 686)
+# }
+# 
+# # FULL pipeline across targets + substitution methods
+# results <- map(targets, function(target) {
+#   map(norm_vars, function(vars) {
+#     
+#     models <- map(vars, fit_bayes_model_all, target = target)
+#     names(models) <- vars
+#     
+#     loos <- map(models, loo)
+#     
+#     list(
+#       models = models,
+#       loos = loos,
+#       comparison = loo_compare(loos)
+#     )
+#   })
+# })
+# # started at 8pm Wednesday 3/18, done by midnight
+# names(results) <- targets
+# names(results[[1]]) <- names(norm_vars)  # assign sub1/sub2/sub3 names
+# 
+# saveRDS(results, "DataProcessed/ww_bayes_results.rds")
+# 
+# results$`sars-cov-2`$sub1$comparison
+# results$`sars-cov-2`$sub2$comparison
+# results$`sars-cov-2`$sub3$comparison
+# 
+# results$`fluav`$sub1$comparison
+# results$`fluav`$sub2$comparison
+# results$`fluav`$sub3$comparison
+# 
+# results$`rsv`$sub1$comparison
+# results$`rsv`$sub2$comparison
+# results$`rsv`$sub3$comparison
+# 
+# ####################################################################################
+# 
+# 
+# 
+# 
+# fit_bayes_model_all <- function(var, target) {
+#   brm(formula = build_formula(var),
+#       data = dplyr::filter(ww_hosp_scale, pcr_target == target),
+#       family = negbinomial(),
+#       chains = 2,
+#       cores = 4,
+#       iter = 2000,
+#       control = list(adapt_delta = 0.95),
+#       seed = 686)
+# }
+# 
+# models_sub1_covid_all <- lapply(norm_vars_sub1, fit_bayes_model_all, target = "sars-cov-2")
+# names(models_sub1_covid_all) <- norm_vars_sub1
+# loos_sub1_covid_all <- lapply(models_sub1_covid_all, loo)
+# loo_compare(loos_sub1_covid_all)
+# 
+# models_sub2_covid_all <- lapply(norm_vars_sub2, fit_bayes_model_all, target = "sars-cov-2")
+# names(models_sub2_covid_all) <- norm_vars_sub2
+# loos_sub2_covid_all <- lapply(models_sub2_covid_all, loo)
+# loo_compare(loos_sub2_covid_all)
+# 
+# models_sub3_covid_all <- lapply(norm_vars_sub3, fit_bayes_model_all, target = "sars-cov-2")
+# names(models_sub3_covid_all) <- norm_vars_sub3
+# loos_sub3_covid_all <- lapply(models_sub3_covid_all, loo)
+# loo_compare(loos_sub3_covid_all)
+# 
+# models_sub1_flu_all <- lapply(norm_vars_sub1, fit_bayes_model_all, target = "fluav")
+# names(models_sub1_flu_all) <- norm_vars_sub1
+# loos_sub1_flu_all <- lapply(models_sub1_flu_all, loo)
+# loo_compare(loos_sub1_flu_all)
+# 
+# models_sub2_flu_all <- lapply(norm_vars_sub2, fit_bayes_model_all, target = "fluav")
+# names(models_sub2_flu_all) <- norm_vars_sub2
+# loos_sub2_flu_all <- lapply(models_sub2_flu_all, loo)
+# loo_compare(loos_sub2_flu_all)
+# 
+# models_sub3_flu_all <- lapply(norm_vars_sub3, fit_bayes_model_all, target = "fluav")
+# names(models_sub3_flu_all) <- norm_vars_sub3
+# loos_sub3_flu_all <- lapply(models_sub3_flu_all, loo)
+# loo_compare(loos_sub3_flu_all)
+# 
+# models_sub1_rsv_all <- lapply(norm_vars_sub1, fit_bayes_model_all, target = "rsv")
+# names(models_sub1_rsv_all) <- norm_vars_sub1
+# loos_sub1_rsv_all <- lapply(models_sub1_rsv_all, loo)
+# loo_compare(loos_sub1_rsv_all)
+# 
+# models_sub2_rsv_all <- lapply(norm_vars_sub2, fit_bayes_model_all, target = "rsv")
+# names(models_sub2_rsv_all) <- norm_vars_sub2
+# loos_sub2_rsv_all <- lapply(models_sub2_rsv_all, loo)
+# loo_compare(loos_sub2_rsv_all)
+# 
+# models_sub3_rsv_all <- lapply(norm_vars_sub3, fit_bayes_model_all, target = "rsv")
+# names(models_sub3_rsv_all) <- norm_vars_sub3
+# loos_sub3_rsv_all <- lapply(models_sub3_rsv_all, loo)
+# loo_compare(loos_sub3_rsv_all)
+# 
+# 
+# 
+# 
+# fit_bayes_model_cat <- function(var, target, ww_cat) {
+#   brm(formula = build_formula(var),
+#       data = dplyr::filter(ww_hosp_scale, pcr_target == target, category == ww_cat),
+#       family = negbinomial(),
+#       chains = 2,
+#       cores = 4,
+#       iter = 2000,
+#       control = list(adapt_delta = 0.95),
+#       seed = 686)
+# }
+# 
+# 
+# 
+# 
+# models_primary_covid_hightourism <- lapply(norm_vars, fit_bayes_model_cat, target = "sars-cov-2", ww_cat = "High Tourism")
+# models_primary_covid_metro <- lapply(norm_vars, fit_bayes_model_cat, target = "sars-cov-2", ww_cat = "Metro")
+# models_primary_covid_other <- lapply(norm_vars, fit_bayes_model_cat, target = "sars-cov-2", ww_cat = "Other")
+# 
+# models_primary_flu_all <- lapply(norm_vars, fit_bayes_model_all, target = "fluav")
+# models_primary_flu_hightourism <- lapply(norm_vars, fit_bayes_model_cat, target = "fluav", ww_cat = "High Tourism")
+# models_primary_flu_metro <- lapply(norm_vars, fit_bayes_model_cat, target = "fluav", ww_cat = "Metro")
+# models_primary_flu_other <- lapply(norm_vars, fit_bayes_model_cat, target = "fluav", ww_cat = "Other")
+# 
+# models_primary_rsv_all <- lapply(norm_vars, fit_bayes_model_all, target = "rsv")
+# models_primary_rsv_hightourism <- lapply(norm_vars, fit_bayes_model_cat, target = "rsv", ww_cat = "High Tourism")
+# models_primary_rsv_metro <- lapply(norm_vars, fit_bayes_model_cat, target = "rsv", ww_cat = "Metro")
+# models_primary_rsv_other <- lapply(norm_vars, fit_bayes_model_cat, target = "rsv", ww_cat = "Other")
+# 
+# # function to generate model performance metrics
+# compare_models_all <- function(model_list) {
+#   data.frame(normalization = norm_names,
+#              AIC = sapply(model_list, AIC),
+#              beta = sapply(model_list, \(m) summary(m)$coefficients$cond[2,1]),
+#              p_value = sapply(model_list, \(m) summary(m)$coefficients$cond[2,4]))
+# }
+# 
+# # compare models
+# model_comparisons <- mget(ls(pattern = "^models_primary_")) %>%
+#   map(~ compare_models_all(.x) %>% arrange(AIC))
+# 
+# all_models_tbl_primary <- imap_dfr(model_comparisons, ~ {
+#   .x %>% 
+#     mutate(
+#       model_set = .y)
+# })
+# 
+# all_models_tbl_primary <- all_models_tbl_primary %>%
+#   separate(model_set, into = c("model", "analysis", "pathogen", "category"), sep = "_", remove = FALSE) %>%
+#   select(analysis, pathogen, category, normalization, AIC, beta, p_value) %>%
+#   mutate(irr = round(exp(beta), 2),
+#          p_value = round(p_value, 3),
+#          significant = ifelse(p_value < 0.05, "yes", "no"))
+# 
+# write.csv(all_models_tbl_primary, "DataProcessed/model_comparisons_all_primary.csv", row.names = FALSE)
+# 
+# 
+# 
+# 
+# models_primary_covid_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "High Tourism")
+# models_primary_covid_metro <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Metro")
+# models_primary_covid_other <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Other")
+# 
+# 
+# 
+# # function to fit NB model to any PCR target (all categories)
+# fit_nb_model_all <- function(var, target) {
+#   glmmTMB(formula = build_formula(var),
+#           family = nbinom2,
+#           data = dplyr::filter(ww_hosp_weekly_scale, pcr_target == target))
+# }
+# 
+# # function to fit NB model to any PCR target (each category)
+# fit_nb_model_cat <- function(var, target, ww_cat) {
+#   glmmTMB(formula = build_formula(var),
+#           family = nbinom2,
+#           data = dplyr::filter(ww_hosp_weekly_scale, pcr_target == target, category == ww_cat))
+# }
+# 
+# fits <- lapply(predictors, function(pred, target, ww_cat) {
+#   brm(formula = as.formula(paste0("admissions ~ ", pred, " + (1 | utility) + offset(log(census_population))")),
+#       data = dplyr::filter(ww_hosp_scale, pcr_target == target, category == ww_cat),
+#       family = negbinomial(),
+#       chains = 4,
+#       cores = 4,
+#       iter = 4000,
+#       control = list(adapt_delta = 0.95),
+#       seed = 686)
+# })
+# 
+# names(fits) <- predictors
+# 
+# loos <- lapply(fits, loo)
+# loo_compare(loos)
+# 
+# 
+# models_primary_covid_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "High Tourism")
+# models_primary_covid_metro <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Metro")
+# models_primary_covid_other <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Other")
+# 
+# 
+# fit <- brm(formula = admissions ~ raw_conc + (1 | utility) + offset(log(census_population)),
+#            data = ww_hosp_scale,
+#            family = negbinomial(),
+#            chains = 4,
+#            cores = 4,
+#            iter = 4000,
+#            control = list(adapt_delta = 0.95))
+# 
+# fit1 <- brm(formula = admissions ~ flow_norm_conc + (1 | utility) + offset(log(census_population)),
+#             data = ww_hosp_scale,
+#             family = negbinomial(),
+#             chains = 4,
+#             cores = 4,
+#             iter = 4000,
+#             control = list(adapt_delta = 0.95))
+# 
+# fit2 <- brm(formula = admissions ~ mobile_norm_conc + (1 | utility) + offset(log(census_population)),
+#             data = ww_hosp_scale,
+#             family = negbinomial(),
+#             chains = 4,
+#             cores = 4,
+#             iter = 4000,
+#             control = list(adapt_delta = 0.95))
+# 
+# loo(fit, fit1)
+# 
+# norm_vars <- c("raw_conc", "flow_norm_conc", "mobile_norm_conc", "combo_norm_conc")
+# 
+# fit_brms_model <- function(var_name, data) {
+#   data_model <- ww_hosp_scale %>%
+#     mutate(conc = ww_hosp_scale[[var_name]])
+#   
+#   brm(formula = admissions ~ conc + offset(log(census_population)) + (1 | utility),
+#       data = data_model,
+#       family = negbinomial(),
+#       chains = 4,
+#       cores = 4,
+#       iter = 4000,
+#       control = list(adapt_delta = 0.95),
+#       seed = 686)
+# }
+# 
+# fits <- map(norm_vars, ~ fit_brms_model(.x, ww_hosp_scale))
+# 
+# 
+# 
+# 
+# 
+# ww_remove_outliers <- ww1 %>%
+#   group_by(utility, pcr_target) %>%
+#   arrange(date) %>%
+#   mutate(roll_mean = cummean(pcr_target_avg_conc),
+#          n = row_number(),
+#          roll_var = cumsum((pcr_target_avg_conc - roll_mean)^2) / pmax(n - 1, 1),
+#          roll_sd = sqrt(roll_var),
+#          z = (pcr_target_avg_conc - roll_mean) / roll_sd) %>%
+#   filter(abs(z) <= 4 | is.na(z)) %>%
+#   select(-(c(roll_mean, n, roll_var, roll_sd, z)))
+# 
+# write.csv(ww_remove_outliers, "DataProcessed/ww_remove_outliers_20260305.csv")
+#   
+# 
+# # ww <- read.csv("DataRaw/2_CDPHE_Wastewater_Data_ 2025-08-04 .csv") %>%
+# #   # cleaning and formatting
+# #   mutate(utility = wwtp_name,
+# #          wwtp_name = tolower(wwtp_name),
+# #          pcr_target = tolower(pcr_target),
+# #          date = as.Date(sample_collect_date, "%Y-%m-%d"),
+# #          test_result_date = as.Date(test_result_date, "%Y-%m-%d")) %>%
+# #   filter(utility %in% sentinel$utility,
+# #          pcr_target %in% c("fluav", "rsv", "sars-cov-2")) %>%
+# #          #date >= "2024-09-30") %>%
+# #   left_join(flow_missing_impute) %>%
+# #   # impute anything BLOD with half the LOD
+# #   mutate(pcr_target_avg_conc = case_when(pcr_target_avg_conc <= lod_sewage ~ lod_sewage/2,
+# #                                          TRUE ~ pcr_target_avg_conc),
+# #          # impute missing and zero flow rates with recovered data
+# #          flow_rate = case_when(flow_rate == 0 ~ flow_rate_impute,
+# #   # set remaining zero flow rates to missing
+# #   TRUE ~ flow_rate)) %>%
+# #   select(-flow_rate_impute) %>%
+# #   group_by(utility, pcr_target) %>%
+# #   # impute the remaining missing flow rates with the average of the last two non-missing flow rates
+# #   mutate(flow_rate_last2avg = slide_dbl(flow_rate,
+# #                                         ~ mean(tail(na.omit(.x), 2)),
+# #                                         .before = Inf,
+# #                                         .complete = F),
+# #          flow_rate = ifelse(is.na(flow_rate), flow_rate_last2avg, flow_rate)) %>%
+# #   select(-flow_rate_last2avg) %>%
+# #   left_join(sentinel)
+# 
+# 
+# 
+# # sampling frequency dataset
+# samp_freq <- desc %>% slice(1)
+# 
+# 
+# sample_type_plot <- list()
+# for(i in 1:length(titles)){
+#   sample_type_plot[[i]] <- ggplot(data = desc %>% filter(pcr_target == pcr_targets[i])) +
+#                                   #aes(x = date, y = flow_rate_per_capita, color = sample_type)) +
+#     geom_point(aes(x = date, y = flow_rate_per_capita, color = sample_type)) +
+#     geom_line(aes(x = date, y = flow_rate_per_capita)) +
+#     labs(x = NULL, y = "Daily Flow Rate per Capita (gal)", color = "Sample Type") +
+#     ggtitle(paste("Flow Rate by Sampling Technique,", titles[i])) +
+#     facet_wrap(~utility, scales = "free") +
+#     theme +
+#     theme(axis.text.x = element_text(angle = 0))
+#   ggsave(paste0("Figures/sample_type_plot_", pcr_targets[i], ".png"), width = 17, height = 9, plot = sample_type_plot[[i]])
+# }
+# 
+# 
+# 
+# # sample_ndays_plot <- list()
+# # for(i in 1:length(titles)){
+# #   sample_ndays_plot[[i]] <- ggplot(data = desc %>% filter(pcr_target == pcr_targets[i])) +
+# #     geom_bar(aes(x = date, y = ndays), stat = "identity") +
+# #     geom_line(aes(x = date, y = mean_ndays), color = "red") +
+# #     labs(x = NULL, y = "Number of Days") +
+# #     scale_y_continuous(limits = c(0, 21), breaks = seq(0, 21, 3)) +
+# #     ggtitle(paste("Number of Days Between Sample Collection and Test Result,", titles[i])) +
+# #     facet_wrap(~utility, scales = "free") +
+# #     theme +
+# #     theme(axis.text.x = element_text(angle = 0))
+# #   ggsave(paste0("Figures/sample_ndays_plot_", pcr_targets[i], ".png"), width = 15, height = 9, plot = sample_ndays_plot[[i]])
+# # }
+# 
+# targets <- c(COVID = "sars-cov-2",
+#              FLUA = "fluav",
+#              RSV = "rsv")
+# 
+# wval <- imap_dfr(targets , ~ {
+#   read.csv(glue::glue("DataProcessed/2026_03_12_dataset/2026_03_12_{.y}_wval.csv")) %>%
+#     mutate(pcr_target = .x,
+#            week_end = as.Date(week_end, "%Y-%m-%d")) %>%
+#     rename(WVAL_conc_weekly = WVAL,
+#            utility = wwtp_name) %>%
+#     select(week_end, pcr_target, utility, WVAL_conc_weekly) %>%
+#     filter(week_end <= "2026-01-31")
+# })
+# 
+# ww_weekly <- desc %>%
+#   group_by(utility, pcr_target) %>%
+#   rename(raw_conc = conc_obs) %>%
+#   # create normalized concentration values
+#   mutate(flow_norm_conc = raw_conc*flow_rate,
+#          mobile_norm_conc = raw_conc/total_devices_daily,
+#          combo_norm_conc = raw_conc*(flow_rate/total_devices_daily)) %>%
+#   # aggregate to weekly
+#   group_by(utility, pcr_target, week_end) %>%
+#   mutate(raw_conc_weekly = median(raw_conc),
+#          flow_norm_conc_weekly = median(flow_norm_conc),
+#          mobile_norm_conc_weekly = median(mobile_norm_conc),
+#          combo_norm_conc_weekly = median(combo_norm_conc)) %>%
+#   slice(1) %>%
+#   select(utility, category, pcr_target, week_end, contains("conc_weekly"), census_population) %>%
+#   left_join(wval)
+# 
+# 
+# hosp_weekly <- hosp %>%
+#   #mutate(week_end = ceiling_date(date, "weeks", week_start = getOption("lubridate.week.start", 6))) %>%
+#   group_by(utility, pcr_target, week_end) %>%
+#   mutate(admissions_weekly = sum(admissions)) %>%
+#   slice(1) %>%
+#   filter(week_end <= "2026-01-31",
+#          utility %in% sentinel$utility) %>%
+#   select(-c(admissions, date))
+# 
+# ww_hosp_weekly <- merge(ww_weekly, hosp_weekly, c("pcr_target", "utility", "week_end"), all = T) %>%
+#   mutate(admissions_weekly = replace_na(admissions_weekly, 0)) %>%
+#   group_by(utility, pcr_target) %>%
+#   fill(category, census_population, raw_conc_weekly, flow_norm_conc_weekly,
+#        mobile_norm_conc_weekly, combo_norm_conc_weekly, WVAL_conc_weekly) %>%
+#   # create lagged variables
+#   mutate(admissions_weekly_w_1 = lag(admissions_weekly, 1)) %>%
+#   mutate(across(c(raw_conc_weekly, flow_norm_conc_weekly, mobile_norm_conc_weekly,
+#                   combo_norm_conc_weekly, WVAL_conc_weekly),
+#                 list(w_1 = ~lag(.x, 1)),
+#                 .names = "{.col}_{.fn}")) %>%
+#   select(utility, category, census_population, pcr_target, contains("week"))
+# 
+# write.csv(ww_hosp_weekly, "DataProcessed/ww_hosp_weekly.csv")
+# 
+# scatter <- list()
+# for(i in 1:length(titles)){
+#   scatter[[i]] <- ggplot(data = ww_hosp_weekly %>% filter(pcr_target == pcr_targets[i]),
+#                          aes(x = raw_conc_weekly, y = admissions_weekly)) +
+#     geom_point() +
+#     geom_smooth(method = "glm.nb", se = TRUE, color = "blue") +
+#     labs(x = "Weekly Raw Concentration (copies/L)", y = "Weekly Total Hospital Admissions (n)") +
+#     ggtitle(paste(titles[i], "Hospital Admissions vs. Raw Viral Concentrations")) +
+#     scale_x_continuous(labels = scales::comma) +
+#     facet_wrap(~utility, scales = "free") +
+#     theme +
+#     theme(axis.text.x = element_text(angle = 0))
+#   ggsave(paste0("Figures/scatter_", pcr_targets[i], ".png"), width = 15, height = 9, plot = scatter[[i]])
+# }
+# 
+# 
+# # do we need zero inflation?
+# m_nb <- glmmTMB(admissions_weekly ~ raw_conc_weekly +
+#                   offset(log(census_population)) + (1 | utility),
+#                 family = nbinom2,
+#                 data = ww_hosp_weekly_scale %>% filter(pcr_target == "sars-cov-2"))
+# 
+# sim <- simulateResiduals(m_nb)
+# plot(sim)
+# testZeroInflation(sim) # p = 0.944, no evidence of excess/structural zeros, do not use ZI model
+# 
+# # check ACF of residuals
+# acf(residuals(m_nb)) # some autocorrelation at 1-8 weeks, include lagged admissions as predictor
+# 
+# # variables to loop over
+# norm_vars <- c("raw_conc_weekly", "flow_norm_conc_weekly", "mobile_norm_conc_weekly",
+#                "combo_norm_conc_weekly", "WVAL_conc_weekly")
+# 
+# norm_names <- c("raw", "flow", "mobile", "combo", "wval")
+# 
+# # function to build NB model formula for any normalization method
+# build_formula <- function(var) {
+#   as.formula(paste("admissions_weekly ~", var,
+#                    "+ admissions_weekly_w_1 + offset(log(census_population)) + (1 | utility)"))
+# }
+# 
+# # function to fit NB model to any PCR target (all categories)
+# fit_nb_model_all <- function(var, target) {
+#   glmmTMB(formula = build_formula(var),
+#           family = nbinom2,
+#           data = dplyr::filter(ww_hosp_weekly_scale, pcr_target == target))
+# }
+# 
+# # function to fit NB model to any PCR target (each category)
+# fit_nb_model_cat <- function(var, target, ww_cat) {
+#   glmmTMB(formula = build_formula(var),
+#           family = nbinom2,
+#           data = dplyr::filter(ww_hosp_weekly_scale, pcr_target == target, category == ww_cat))
+# }
+# 
+# # run models for each pathogen and category
+# models_primary_covid_all <- lapply(norm_vars, fit_nb_model_all, target = "sars-cov-2")
+# models_primary_covid_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "High Tourism")
+# models_primary_covid_metro <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Metro")
+# models_primary_covid_other <- lapply(norm_vars, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Other")
+# 
+# models_primary_flu_all <- lapply(norm_vars, fit_nb_model_all, target = "fluav")
+# models_primary_flu_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "fluav", ww_cat = "High Tourism")
+# models_primary_flu_metro <- lapply(norm_vars, fit_nb_model_cat, target = "fluav", ww_cat = "Metro")
+# models_primary_flu_other <- lapply(norm_vars, fit_nb_model_cat, target = "fluav", ww_cat = "Other")
+# 
+# models_primary_rsv_all <- lapply(norm_vars, fit_nb_model_all, target = "rsv")
+# models_primary_rsv_hightourism <- lapply(norm_vars, fit_nb_model_cat, target = "rsv", ww_cat = "High Tourism")
+# models_primary_rsv_metro <- lapply(norm_vars, fit_nb_model_cat, target = "rsv", ww_cat = "Metro")
+# models_primary_rsv_other <- lapply(norm_vars, fit_nb_model_cat, target = "rsv", ww_cat = "Other")
+# 
+# # function to generate model performance metrics
+# compare_models_all <- function(model_list) {
+#   data.frame(normalization = norm_names,
+#              AIC = sapply(model_list, AIC),
+#              beta = sapply(model_list, \(m) summary(m)$coefficients$cond[2,1]),
+#              p_value = sapply(model_list, \(m) summary(m)$coefficients$cond[2,4]))
+# }
+# 
+# # compare models
+# model_comparisons <- mget(ls(pattern = "^models_primary_")) %>%
+#   map(~ compare_models_all(.x) %>% arrange(AIC))
+# 
+# all_models_tbl_primary <- imap_dfr(model_comparisons, ~ {
+#   .x %>% 
+#     mutate(
+#       model_set = .y)
+# })
+# 
+# all_models_tbl_primary <- all_models_tbl_primary %>%
+#   separate(model_set, into = c("model", "analysis", "pathogen", "category"), sep = "_", remove = FALSE) %>%
+#   select(analysis, pathogen, category, normalization, AIC, beta, p_value) %>%
+#   mutate(irr = round(exp(beta), 2),
+#          p_value = round(p_value, 3),
+#          significant = ifelse(p_value < 0.05, "yes", "no"))
+# 
+# write.csv(all_models_tbl_primary, "DataProcessed/model_comparisons_all_primary.csv", row.names = FALSE)
+# 
+# all_models_irr_primary <- all_models_tbl_primary %>%
+#   arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
+#   select(pathogen, category, normalization, irr) %>%
+#   pivot_wider(names_from = normalization, values_from = irr)
+# 
+# write.csv(all_models_irr_primary, "DataProcessed/all_models_irr_primary.csv")
+# 
+# all_models_aic_primary <- all_models_tbl_primary %>%
+#   group_by(pathogen, category) %>%
+#   mutate(rank = ifelse(is.na(AIC), NA, row_number()),
+#          delta_AIC_next = AIC - lag(AIC),
+#          delta_AIC_cumul = AIC - min(AIC),
+#          AIC_weight = round(exp(-0.5*delta_AIC_cumul) / sum(exp(-0.5*delta_AIC_cumul)), 3)) %>%
+#   select(pathogen, category, normalization, contains("AIC"), rank)
+# 
+# write.csv(all_models_aic_primary, "DataProcessed/all_models_aic_primary.csv")
+# 
+# all_models_rank_primary <- all_models_aic_primary %>%
+#   arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
+#   select(pathogen, category, normalization, rank) %>%
+#   pivot_wider(names_from = normalization, values_from = rank)
+# 
+# write.csv(all_models_rank_primary, "DataProcessed/all_models_rank_primary.csv")
+# 
+# # SENSITIVITY ANALYSIS
+# # variables to loop over
+# norm_vars_sens <- c("raw_conc_weekly_w_1", "flow_norm_conc_weekly_w_1", "mobile_norm_conc_weekly_w_1",
+#                "combo_norm_conc_weekly_w_1", "WVAL_conc_weekly_w_1")
+# 
+# norm_names_sens <- c("raw_w_1", "flow_w_1", "mobile_w_1", "combo_w_1", "wval_w_1")
+# 
+# # run models for each pathogen and category (sensitivity analysis)
+# models_sensitivity_covid_all <- lapply(norm_vars_sens, fit_nb_model_all, target = "sars-cov-2")
+# models_sensitivity_covid_hightourism <- lapply(norm_vars_sens, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "High Tourism")
+# models_sensitivity_covid_metro <- lapply(norm_vars_sens, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Metro")
+# models_sensitivity_covid_other <- lapply(norm_vars_sens, fit_nb_model_cat, target = "sars-cov-2", ww_cat = "Other")
+# 
+# models_sensitivity_flu_all <- lapply(norm_vars_sens, fit_nb_model_all, target = "fluav")
+# models_sensitivity_flu_hightourism <- lapply(norm_vars_sens, fit_nb_model_cat, target = "fluav", ww_cat = "High Tourism")
+# models_sensitivity_flu_metro <- lapply(norm_vars_sens, fit_nb_model_cat, target = "fluav", ww_cat = "Metro")
+# models_sensitivity_flu_other <- lapply(norm_vars_sens, fit_nb_model_cat, target = "fluav", ww_cat = "Other")
+# 
+# models_sensitivity_rsv_all <- lapply(norm_vars_sens, fit_nb_model_all, target = "rsv")
+# models_sensitivity_rsv_hightourism <- lapply(norm_vars_sens, fit_nb_model_cat, target = "rsv", ww_cat = "High Tourism")
+# models_sensitivity_rsv_metro <- lapply(norm_vars_sens, fit_nb_model_cat, target = "rsv", ww_cat = "Metro")
+# models_sensitivity_rsv_other <- lapply(norm_vars_sens, fit_nb_model_cat, target = "rsv", ww_cat = "Other")
+# 
+# # compare models
+# model_comparisons_sens <- mget(ls(pattern = "^models_sensitivity_")) %>%
+#   map(~ compare_models_all(.x) %>% arrange(AIC))
+# 
+# all_models_tbl_sensitivity <- imap_dfr(model_comparisons_sens, ~ {
+#   .x %>% 
+#     mutate(
+#       model_set = .y)
+# })
+# 
+# all_models_tbl_sensitivity <- all_models_tbl_sensitivity %>%
+#   separate(model_set, into = c("model", "analysis", "pathogen", "category"), sep = "_", remove = FALSE) %>%
+#   select(analysis, pathogen, category, normalization, AIC, beta, p_value) %>%
+#   mutate(irr = round(exp(beta), 2),
+#          p_value = round(p_value, 3),
+#          significant = ifelse(p_value < 0.05, "yes", "no"))
+# 
+# write.csv(all_models_tbl_sensitivity, "DataProcessed/model_comparisons_all_sensitivity.csv", row.names = FALSE)
+# 
+# all_models_irr_sensitivity <- all_models_tbl_sensitivity %>%
+#   arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
+#   select(pathogen, category, normalization, irr) %>%
+#   pivot_wider(names_from = normalization, values_from = irr)
+# 
+# write.csv(all_models_irr_sensitivity, "DataProcessed/all_models_irr_sensitivity.csv")
+# 
+# all_models_aic_sensitivity <- all_models_tbl_sensitivity %>%
+#   group_by(pathogen, category) %>%
+#   mutate(rank = ifelse(is.na(AIC), NA, row_number()),
+#          delta_AIC_next = AIC - lag(AIC),
+#          delta_AIC_cumul = AIC - min(AIC),
+#          AIC_weight = round(exp(-0.5*delta_AIC_cumul) / sum(exp(-0.5*delta_AIC_cumul)), 3)) %>%
+#   select(pathogen, category, normalization, contains("AIC"), rank)
+# 
+# write.csv(all_models_aic_sensitivity, "DataProcessed/all_models_aic_sensitivity.csv")
+# 
+# all_models_rank_sensitivity <- all_models_aic_sensitivity %>%
+#   arrange(pathogen, category, match(normalization, c("raw", "flow", "mobile", "combo", "wval"))) %>%
+#   select(pathogen, category, normalization, rank) %>%
+#   pivot_wider(names_from = normalization, values_from = rank)
+# 
+# write.csv(all_models_rank_sensitivity, "DataProcessed/all_models_rank_sensitivity.csv")
+# 
+# # ww_hosp_norm <- ww_hosp %>%
+# #   mutate(detect = ifelse(pcr_target_below_lod == "yes", 0, 1),
+# #          raw_conc_sub1 = ifelse(pcr_target_below_lod == "yes", lod_sewage, pcr_target_avg_conc),
+# #          lod_flow = lod_sewage*flow_rate,
+# #          lod_mobile = lod_sewage/total_devices_daily,
+# #          lod_combo = lod_sewage*(flow_rate/total_devices_daily),
+# #          flow_norm_conc_sub1 = ifelse(pcr_target_below_lod == "yes", lod_flow, pcr_target_avg_conc*flow_rate),
+# #          mobile_norm_conc_sub1 = ifelse(pcr_target_below_lod == "yes", lod_mobile, pcr_target_avg_conc/total_devices_daily),
+# #          combo_norm_conc_sub1 = ifelse(pcr_target_below_lod == "yes", lod_combo, pcr_target_avg_conc*(flow_rate/total_devices_daily)),
+# #          raw_conc_sub2 = ifelse(pcr_target_below_lod == "yes", lod_sewage/2, pcr_target_avg_conc),
+# #          flow_norm_conc_sub2 = ifelse(pcr_target_below_lod == "yes", lod_flow/2, pcr_target_avg_conc*flow_rate),
+# #          mobile_norm_conc_sub2 = ifelse(pcr_target_below_lod == "yes", lod_mobile/2, pcr_target_avg_conc/total_devices_daily),
+# #          combo_norm_conc_sub2 = ifelse(pcr_target_below_lod == "yes", lod_combo/2, pcr_target_avg_conc*(flow_rate/total_devices_daily)),
+# #          raw_conc_sub3 = ifelse(pcr_target_below_lod == "yes", lod_sewage/sqrt(2), pcr_target_avg_conc),
+# #          flow_norm_conc_sub3 = ifelse(pcr_target_below_lod == "yes", lod_flow/sqrt(2), pcr_target_avg_conc*flow_rate),
+# #          mobile_norm_conc_sub3 = ifelse(pcr_target_below_lod == "yes", lod_mobile/sqrt(2), pcr_target_avg_conc/total_devices_daily),
+# #          combo_norm_conc_sub3 = ifelse(pcr_target_below_lod == "yes", lod_combo/sqrt(2), pcr_target_avg_conc*(flow_rate/total_devices_daily))) %>%
+# #   mutate(across(c(contains("conc")),
+# #                 list(w_1 = ~lag(.x, 2)),
+# #                 .names = "{.col}_{.fn}")) %>%
+# #   select(utility, category, pcr_target, date, detect, contains("conc"), -contains("lod"),
+# #          -contains("pcr_target_avg_conc"), admissions, census_population)
+# 
+# # 
+# # 
+# # 
+# # cbg_2010 <- get_decennial(geography = "block group",
+# #                           variables = "P001001",
+# #                           state = "CO",
+# #                           year = 2010,
+# #                           geometry = TRUE) %>%
+# #   rename(pop_2010 = value) %>%
+# #   select(GEOID, pop_2010)
+# # 
+# # cbg_2019 <- get_acs(geography = "block group",
+# #                     variables = "B01003_001",
+# #                     state = "CO",
+# #                     year = 2019,
+# #                     geometry = FALSE) %>%
+# #   rename(pop_2019 = estimate) %>%
+# #   select(GEOID, pop_2019)
+# # 
+# # cbg_growth = merge(cbg_2010, cbg_2019, "GEOID", all = T) %>%
+# #   mutate(growth_factor = pop_2019/pop_2010)
+# # 
+# # co_counties <- counties(state = "CO", cb = TRUE, class = "sf")
+# # 
+# # cbg_growth <- ggplot(cbg_growth, aes(fill = growth_factor)) +
+# #   geom_sf(color = NA) +
+# #   geom_sf(data = co_counties, fill = NA, color = "black", size = 0.1) +
+# #   scale_fill_viridis_c(option = "magma", direction = -1); cbg_growth
+# # 
+# # ggsave("Figures/cbg_growth.png", width = 5, height = 4, plot = cbg_growth)
+# 
+# 
+# 
+# sample_type_plot <- list()
+# for(i in 1:length(titles)){
+#   sample_type_plot[[i]] <- ggplot(data = desc %>% filter(pcr_target == pcr_targets[i])) +
+#     #aes(x = date, y = flow_rate_per_capita, color = sample_type)) +
+#     geom_point(aes(x = date, y = flow_rate_per_capita, color = sample_type)) +
+#     geom_line(aes(x = date, y = flow_rate_per_capita)) +
+#     labs(x = NULL, y = "Daily Flow Rate per Capita (gal)", color = "Sample Type") +
+#     ggtitle(paste("Flow Rate by Sampling Technique,", titles[i])) +
+#     facet_wrap(~utility, scales = "free") +
+#     theme +
+#     theme(axis.text.x = element_text(angle = 0))
+#   ggsave(paste0("Figures/sample_type_plot_", pcr_targets[i], ".png"), width = 17, height = 9, plot = sample_type_plot[[i]])
+# }
+# 
+# hosp_covid <- bind_rows(hosp_covid1, hosp_covid2) %>%
+#   mutate(pcr_target = "sars-cov-2") %>%
+#   rename(utility = Region.Name,
+#          admissions = Hospitalized.Count) %>%
+#   filter(utility %in% sentinel$utility) %>%
+#   select(utility, pcr_target, date, admissions, dataset) %>%
+#   group_by(utility, pcr_target, date) %>%
+#   # identify any duplicate observations (resulting from overlapping dates in the two datasets)
+#   add_count() %>%
+#   group_by(utility, pcr_target, date) %>%
+#   slice(1)
+# 
+# hosp_flu1 <- read.csv("DataRaw/2026/Flu_agg.csv") %>%
+#   filter(Region.Level == "Sewershed",
+#          Pathogen.Name == "INFLUENZA A") %>%
+#   mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
+#          dataset = 1)
+# 
+# hosp_flu2 <- read.csv("DataRaw/CSPH Data _ April 2026/Flu_agg_April_update.csv") %>%
+#   filter(Region.Level == "Sewershed",
+#          Pathogen.Name == "INFLUENZA A") %>%
+#   mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
+#          dataset = 2)
+# 
+# hosp_flu <- bind_rows(hosp_flu1, hosp_flu2) %>%
+#   mutate(pcr_target = "fluav") %>%
+#   rename(utility = Region.Name,
+#          admissions = Hospitalized.Count) %>%
+#   filter(utility %in% sentinel$utility) %>%
+#   select(utility, pcr_target, date, admissions, dataset) %>%
+#   group_by(utility, pcr_target, date) %>%
+#   # identify any duplicate observations (resulting from overlapping dates in the two datasets)
+#   add_count() %>%
+#   group_by(utility, pcr_target, date) %>%
+#   slice(1)
+# 
+# hosp_rsv1 <- read.csv("DataRaw/2026/RSV_agg.csv") %>%
+#   filter(Region.Level == "Sewershed") %>%
+#   group_by(Region.Name, Event.Onset.Date) %>%
+#   mutate(Hospitalized.Count = sum(Hospitalized.Count)) %>%
+#   slice(1) %>%
+#   select(-Age.Group) %>%
+#   mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
+#          dataset = 1)
+# 
+# hosp_rsv2 <- read.csv("DataRaw/CSPH Data _ April 2026/RSV_agg_April_update.csv") %>%
+#   filter(Region.Level == "Sewershed") %>%
+#   group_by(Region.Name, Event.Onset.Date) %>%
+#   mutate(Hospitalized.Count = sum(Hospitalized.Count)) %>%
+#   slice(1) %>%
+#   select(-Age.Group) %>%
+#   mutate(date = as.Date(Event.Onset.Date, "%m/%d/%Y"),
+#          dataset = 2)
+# 
+# hosp_rsv <- bind_rows(hosp_rsv1, hosp_rsv2) %>%
+#   ungroup() %>%
+#   mutate(pcr_target = "rsv") %>%
+#   rename(utility = Region.Name,
+#          admissions = Hospitalized.Count) %>%
+#   filter(utility %in% sentinel$utility) %>%
+#   select(utility, pcr_target, date, admissions, dataset) %>%
+#   group_by(utility, pcr_target, date) %>%
+#   # identify any duplicate observations (resulting from overlapping dates in the two datasets)
+#   add_count() %>%
+#   group_by(utility, pcr_target, date) %>%
+#   slice(1)
+# 
+# ##########################################################################################
+# 
